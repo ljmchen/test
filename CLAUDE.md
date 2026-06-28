@@ -66,7 +66,29 @@ python test_sanity.py  # 4 tests: rotation, pointnet2, flow_matching, full_model
 
 All tests run on CPU, no GPU required. Tests verify tensor shapes and round-trip correctness.
 
-## Data Path Convention
+## Data Convention (LGBiDex format)
 
-Mesh files: `{mesh_root}/{obj_id}/mesh/simplified.obj`
-Default mesh_root: `/mnt/afs/L202500241/Dataset/MeshProcess/assets/object/oakink_obj/processed_data`
+Splits are JSON arrays of records, one grasp per record. Input processing in
+`data/dataset.py` (and `data/lgbidex_io.py`) mirrors the dexvlm pipeline's
+`LgbiDexDataset` so both reproductions share coordinate conventions.
+
+Per-object files under `mesh_root`:
+- Colored point cloud: `{mesh_root}/{obj_id}/pc_part/simplified_part_{N}.ply`
+- Mesh (fallback / bbox): `{mesh_root}/{obj_id}/mesh/simplified.obj`
+
+Record fields:
+- `obj_id`, `obj_pose` (7D = translation + wxyz quaternion), `obj_scale` (~0.1)
+- `guidance` (instruction text), `cate_id`, `action`
+- `dex_grasp_left` / `dex_grasp_right`: 28D `[trans(3), axis_angle(3), joints(22)]`
+
+Processing: point cloud is bbox-centered and placed by the object rotation/scale
+(`center_on_object`); grasp translations are shifted into the same frame and the
+**axis-angle** rotation is converted to 6D. Output per hand is the 31D pose vector
+`[trans(3), rot6d(6), joints(22)]`; the batch `gt_poses` is `(B, 2, 31)`.
+
+Local paths (this machine):
+- mesh_root: `/home/jiaxuan/wowowowo/slai/Dataset/MeshProcess/assets/object/oakink_obj/processed_data`
+- splits: `/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/{train_v3,test_v3}.json`
+
+Run training with the `dexvlg` conda env:
+`/mnt/conda/jiaxuan/miniconda3/envs/dexvlg/bin/python train.py --config configs/default.yaml --stage 1`

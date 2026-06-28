@@ -172,9 +172,15 @@ def main():
     test_dataset = DexGraspDataset(
         data_path=test_path,
         mesh_root=data_cfg["mesh_root"],
-        n_points=data_cfg.get("n_points", 10000),
+        n_points=data_cfg.get("n_points", 4096),
         joint_dim=cfg["model"].get("joint_dim", 22),
         augment=False,
+        point_cloud_source=data_cfg.get("point_cloud_source", "auto"),
+        point_cloud_color_mode=data_cfg.get("point_cloud_color_mode", "real"),
+        point_cloud_color_fill=data_cfg.get("point_cloud_color_fill", 0.4),
+        point_cloud_file_points=data_cfg.get("point_cloud_file_points", None),
+        center_on_object=data_cfg.get("center_on_object", True),
+        obj_pose_quaternion_order=data_cfg.get("obj_pose_quaternion_order", "wxyz"),
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset,

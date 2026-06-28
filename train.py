@@ -223,12 +223,21 @@ def main():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     data_cfg = cfg["data"]
+    dataset_kwargs = dict(
+        point_cloud_source=data_cfg.get("point_cloud_source", "auto"),
+        point_cloud_color_mode=data_cfg.get("point_cloud_color_mode", "real"),
+        point_cloud_color_fill=data_cfg.get("point_cloud_color_fill", 0.4),
+        point_cloud_file_points=data_cfg.get("point_cloud_file_points", None),
+        center_on_object=data_cfg.get("center_on_object", True),
+        obj_pose_quaternion_order=data_cfg.get("obj_pose_quaternion_order", "wxyz"),
+    )
     train_dataset = DexGraspDataset(
         data_path=data_cfg["train_data"],
         mesh_root=data_cfg["mesh_root"],
-        n_points=data_cfg.get("n_points", 10000),
+        n_points=data_cfg.get("n_points", 4096),
         joint_dim=cfg["model"].get("joint_dim", 22),
-        augment=data_cfg.get("augment", True),
+        augment=data_cfg.get("augment", False),
+        **dataset_kwargs,
     )
     train_sampler = DistributedSampler(train_dataset) if distributed else None
     train_loader = torch.utils.data.DataLoader(
@@ -247,9 +256,10 @@ def main():
         val_dataset = DexGraspDataset(
             data_path=data_cfg["val_data"],
             mesh_root=data_cfg["mesh_root"],
-            n_points=data_cfg.get("n_points", 10000),
+            n_points=data_cfg.get("n_points", 4096),
             joint_dim=cfg["model"].get("joint_dim", 22),
             augment=False,
+            **dataset_kwargs,
         )
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if distributed else None
         val_loader = torch.utils.data.DataLoader(

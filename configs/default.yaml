@@ -4,6 +4,8 @@
 # ─── Model ────────────────────────────────────────────────────────────
 model:
   # Point cloud encoder (PointNet++ replacing Uni3D)
+  # 6 = xyz(3) + rgb(3): the model always feeds colored point clouds
+  # (encode_condition -> pc_encoder(xyz, rgb)), so the encoder must accept 6ch.
   pc_in_channels: 6          # xyz + rgb
   pc_feature_dim: 256
   num_pc_tokens: 64
@@ -25,13 +27,21 @@ model:
   joint_dim: 22               # 22 DOF for Shadow Hand
 
 # ─── Data ─────────────────────────────────────────────────────────────
+# LGBiDex bimanual format (mirrors dexvlm's LgbiDexDataset input processing).
 data:
-  train_data: "data/train.json"
-  val_data: "data/val.json"
-  test_data: "data/test.json"
-  mesh_root: "/mnt/afs/L202500241/Dataset/MeshProcess/assets/object/oakink_obj/processed_data"
-  n_points: 10000             # Number of points sampled via FPS
-  augment: true
+  train_data: "/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/train_v3.json"
+  val_data: "/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/test_v3.json"
+  test_data: "/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/test_v3.json"
+  mesh_root: "/home/jiaxuan/wowowowo/slai/Dataset/MeshProcess/assets/object/oakink_obj/processed_data"
+  n_points: 4096                    # Must match the PLY tag simplified_part_{N}.ply
+  augment: false                    # Rotation aug breaks PC/grasp correspondence; keep off
+  # Point cloud sourcing (see data/dataset.py)
+  point_cloud_source: auto          # auto | colored_ply | mesh_sample
+  point_cloud_color_mode: real      # real (use PLY RGB) | fill (constant)
+  point_cloud_color_fill: 0.4
+  # Object-centered coordinate convention (matches dexvlm)
+  center_on_object: true
+  obj_pose_quaternion_order: wxyz
 
 # ─── Training ─────────────────────────────────────────────────────────
 training:
@@ -66,8 +76,8 @@ training:
 
 # ─── Inference ────────────────────────────────────────────────────────
 inference:
-  num_steps: 50               # Euler ODE integration steps
-  batch_size: 16
+  num_steps: 10               # Euler ODE integration steps
+  batch_size: 64
 
 # ─── Paths ────────────────────────────────────────────────────────────
 paths:

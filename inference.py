@@ -39,11 +39,12 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    cfg = yaml.safe_load(open(args.config, "r"))
+    with open(args.config, "r") as f:
+        cfg = yaml.safe_load(f)
 
     print("Loading model...")
     model = DexVLG(cfg["model"]).cuda()
-    ckpt = torch.load(args.checkpoint, map_location="cuda")
+    ckpt = torch.load(args.checkpoint, map_location="cuda", weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     print(f"Model loaded from epoch {ckpt.get('epoch', '?')}")

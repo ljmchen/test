@@ -66,16 +66,6 @@ class SimpleTokenizer:
         return result
 
 
-class _TokenizerOutput:
-    """Wraps tokenizer dict to support .to(device)."""
-
-    def __init__(self, data: dict):
-        self.data = data
-
-    def to(self, device):
-        return {k: v.to(device) for k, v in self.data.items()}
-
-
 class FusionTransformer(nn.Module):
     """Lightweight transformer that fuses point cloud and language tokens.
 
@@ -228,12 +218,10 @@ class DexVLG(nn.Module):
             max_length=128,
             return_tensors="pt",
         )
-        if isinstance(encoded, _TokenizerOutput):
-            encoded = encoded.to(device)
-        elif isinstance(encoded, dict):
+        if isinstance(encoded, dict):
             encoded = {k: v.to(device) for k, v in encoded.items()}
         else:
-            encoded = encoded.to(device)
+            encoded = {k: v.to(device) for k, v in encoded.items()}
 
         output = self.bert(
             input_ids=encoded["input_ids"],

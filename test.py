@@ -154,14 +154,15 @@ def evaluate(
 
 def main():
     args = parse_args()
-    cfg = yaml.safe_load(open(args.config, "r"))
+    with open(args.config, "r") as f:
+        cfg = yaml.safe_load(f)
     set_seed(cfg["training"].get("seed", 42))
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("Loading model...")
     model = DexVLG(cfg["model"]).cuda()
-    ckpt = torch.load(args.checkpoint, map_location="cuda")
+    ckpt = torch.load(args.checkpoint, map_location="cuda", weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     print(f"Loaded checkpoint from epoch {ckpt.get('epoch', '?')}")
 

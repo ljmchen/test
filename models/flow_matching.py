@@ -8,7 +8,6 @@ to the fused point-cloud + language features from the backbone.
 import math
 import torch
 import torch.nn as nn
-from einops import rearrange
 
 
 def sinusoidal_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:

@@ -70,12 +70,14 @@ def sample_point_cloud_from_mesh(
 
     points, face_indices = trimesh.sample.sample_surface(mesh, n_points * 2)
 
-    if mesh.visual.kind == "face" or mesh.visual.kind == "vertex":
-        try:
-            colors = mesh.visual.interpolated_face_color(face_indices)[:, :3]
-        except Exception:
+    try:
+        if hasattr(mesh.visual, "face_colors") and mesh.visual.face_colors is not None:
+            colors = mesh.visual.face_colors[face_indices][:, :3]
+        elif hasattr(mesh.visual, "vertex_colors") and mesh.visual.vertex_colors is not None:
+            colors = mesh.visual.vertex_colors[:len(points), :3]
+        else:
             colors = np.full((len(points), 3), 128, dtype=np.uint8)
-    else:
+    except Exception:
         colors = np.full((len(points), 3), 128, dtype=np.uint8)
 
     idx = farthest_point_sample_np(points, n_points)

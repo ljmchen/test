@@ -98,7 +98,7 @@ def train_one_epoch(
     model.train()
     loss_meter = AverageMeter()
     use_fp16 = cfg["training"].get("fp16", True)
-    grad_clip = cfg["training"].get("stage1", {}).get("grad_clip", 1.0)
+    grad_clip = cfg["training"].get("_grad_clip", 1.0)
     log_interval = cfg["training"].get("log_interval", 50)
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=rank != 0)
@@ -282,7 +282,7 @@ def main():
     best_val_loss = float("inf")
 
     if args.resume:
-        ckpt = torch.load(args.resume, map_location="cuda")
+        ckpt = torch.load(args.resume, map_location="cuda", weights_only=False)
         base_model = model.module if hasattr(model, "module") else model
         base_model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -303,6 +303,7 @@ def main():
         if distributed:
             train_sampler.set_epoch(epoch)
 
+        cfg["training"]["_grad_clip"] = stage_cfg.get("grad_clip", 1.0)
         train_loss, global_step = train_one_epoch(
             model, train_loader, optimizer, scheduler, scaler,
             epoch, cfg, writer, rank, global_step,

@@ -1,0 +1,76 @@
+# DexVLG Default Configuration
+# Bimanual dexterous grasp generation with language guidance
+
+# ─── Model ────────────────────────────────────────────────────────────
+model:
+  # Point cloud encoder (PointNet++ replacing Uni3D)
+  pc_in_channels: 6          # xyz + rgb
+  pc_feature_dim: 256
+  num_pc_tokens: 64
+
+  # Language model (BERT replacing Florence-2)
+  bert_model: "bert-base-uncased"
+  bert_dim: 768
+  freeze_bert_embeddings: false
+
+  # Fusion transformer
+  fusion_depth: 4
+
+  # Flow-Matching Transformer
+  flow_hidden_dim: 256
+  flow_depth: 6
+  flow_heads: 8
+
+  # Grasp pose dimensions (Shadow Hand)
+  joint_dim: 22               # 22 DOF for Shadow Hand
+
+# ─── Data ─────────────────────────────────────────────────────────────
+data:
+  train_data: "data/train.json"
+  val_data: "data/val.json"
+  test_data: "data/test.json"
+  mesh_root: "/mnt/afs/L202500241/Dataset/MeshProcess/assets/object/oakink_obj/processed_data"
+  n_points: 10000             # Number of points sampled via FPS
+  augment: true
+
+# ─── Training ─────────────────────────────────────────────────────────
+training:
+  # Stage 1: Train full model (encoder + projector + fusion + flow head)
+  stage1:
+    epochs: 50
+    batch_size: 32
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    warmup_steps: 1000
+    grad_clip: 1.0
+    freeze_bert: false
+
+  # Stage 2: Freeze backbone, train only flow-matching head
+  stage2:
+    epochs: 30
+    batch_size: 64
+    lr: 5.0e-5
+    weight_decay: 1.0e-5
+    warmup_steps: 500
+    grad_clip: 1.0
+    freeze_backbone: true
+
+  optimizer: "adamw"
+  scheduler: "cosine"
+  num_workers: 4
+  seed: 42
+  fp16: true
+  log_interval: 50
+  save_interval: 5
+  val_interval: 1
+
+# ─── Inference ────────────────────────────────────────────────────────
+inference:
+  num_steps: 50               # Euler ODE integration steps
+  batch_size: 16
+
+# ─── Paths ────────────────────────────────────────────────────────────
+paths:
+  output_dir: "outputs"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"

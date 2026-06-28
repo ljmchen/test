@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Training outputs
+outputs/
+checkpoints/
+logs/
+results/
+*.pt
+*.pth
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environments
+.env
+.venv/
+venv/

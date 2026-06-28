@@ -1,14 +1,10 @@
 """Training script for DexVLG bimanual dexterous grasp generation.
 
-Implements two-stage training following the DexVLG paradigm:
-    Stage 1: Train the full model end-to-end (PC encoder, projector,
-             fusion transformer, flow-matching head).
-    Stage 2: Freeze the vision-language backbone and fine-tune only the
-             flow-matching head, which resolves optimization conflicts
-             between the VLM and denoising objectives.
+Trains the full model end-to-end: PC encoder, projector, fusion transformer,
+and flow-matching head, using conditional flow matching loss.
 
 Usage:
-    python train.py --config configs/default.yaml [--stage 1|2] [--resume PATH]
+    python train.py --config configs/default.yaml [--resume PATH]
 """
 
 import argparse
@@ -32,7 +28,6 @@ from utils.misc import set_seed, count_parameters, AverageMeter
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train DexVLG model")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--stage", type=int, default=1, choices=[1, 2])
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--output_dir", type=str, default=None)
@@ -58,16 +53,6 @@ def get_cosine_schedule_with_warmup(
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-
-def freeze_backbone(model: DexVLG) -> None:
-    """Freeze vision-language backbone, keep flow-matching head trainable."""
-    for name, param in model.named_parameters():
-        if not any(
-            key in name
-            for key in ["flow_transformer", "hand_embed"]
-        ):
-            param.requires_grad = False
 
 
 def setup_distributed() -> tuple[int, int]:
@@ -98,7 +83,7 @@ def train_one_epoch(
     model.train()
     loss_meter = AverageMeter()
     use_fp16 = cfg["training"].get("fp16", True)
-    grad_clip = cfg["training"].get("_grad_clip", 1.0)
+    grad_clip = cfg["training"].get("grad_clip", 1.0)
     log_interval = cfg["training"].get("log_interval", 50)
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=rank != 0)
@@ -191,12 +176,12 @@ def main():
     rank, local_rank = setup_distributed()
     distributed = dist.is_initialized()
 
-    set_seed(cfg["training"].get("seed", 42))
+    train_cfg = cfg["training"]
+    set_seed(train_cfg.get("seed", 42))
 
-    stage_cfg = cfg["training"][f"stage{args.stage}"]
     output_dir = args.output_dir or cfg["paths"]["output_dir"]
-    ckpt_dir = os.path.join(output_dir, cfg["paths"]["checkpoint_dir"], f"stage{args.stage}")
-    log_dir = os.path.join(output_dir, cfg["paths"]["log_dir"], f"stage{args.stage}")
+    ckpt_dir = os.path.join(output_dir, cfg["paths"]["checkpoint_dir"])
+    log_dir = os.path.join(output_dir, cfg["paths"]["log_dir"])
     os.makedirs(ckpt_dir, exist_ok=True)
 
     writer = None
@@ -205,14 +190,11 @@ def main():
         writer = SummaryWriter(log_dir)
 
     if rank == 0:
-        print(f"=== DexVLG Training Stage {args.stage} ===")
+        print("=== DexVLG Training ===")
         print(f"Config: {args.config}")
         print(f"Output: {output_dir}")
 
     model = DexVLG(cfg["model"]).cuda()
-
-    if args.stage == 2:
-        freeze_backbone(model)
 
     if rank == 0:
         total = count_parameters(model)
@@ -242,10 +224,10 @@ def main():
     train_sampler = DistributedSampler(train_dataset) if distributed else None
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=stage_cfg["batch_size"],
+        batch_size=train_cfg["batch_size"],
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        num_workers=cfg["training"].get("num_workers", 4),
+        num_workers=train_cfg.get("num_workers", 4),
         collate_fn=collate_fn,
         pin_memory=True,
         drop_last=True,
@@ -264,10 +246,10 @@ def main():
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if distributed else None
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
-            batch_size=stage_cfg["batch_size"],
+            batch_size=train_cfg["batch_size"],
             shuffle=False,
             sampler=val_sampler,
-            num_workers=cfg["training"].get("num_workers", 4),
+            num_workers=train_cfg.get("num_workers", 4),
             collate_fn=collate_fn,
             pin_memory=True,
         )
@@ -277,15 +259,15 @@ def main():
     ]
     optimizer = torch.optim.AdamW(
         param_groups,
-        lr=stage_cfg["lr"],
-        weight_decay=stage_cfg.get("weight_decay", 1e-4),
+        lr=train_cfg["lr"],
+        weight_decay=train_cfg.get("weight_decay", 1e-4),
     )
 
-    total_steps = len(train_loader) * stage_cfg["epochs"]
+    total_steps = len(train_loader) * train_cfg["epochs"]
     scheduler = get_cosine_schedule_with_warmup(
-        optimizer, stage_cfg.get("warmup_steps", 1000), total_steps,
+        optimizer, train_cfg.get("warmup_steps", 1000), total_steps,
     )
-    scaler = GradScaler("cuda", enabled=cfg["training"].get("fp16", True))
+    scaler = GradScaler("cuda", enabled=train_cfg.get("fp16", True))
 
     start_epoch = 0
     global_step = 0
@@ -305,22 +287,21 @@ def main():
             print(f"Resumed from epoch {start_epoch}, step {global_step}")
 
     if rank == 0:
-        print(f"Training for {stage_cfg['epochs']} epochs, {total_steps} steps")
-        print(f"Batch size: {stage_cfg['batch_size']}, LR: {stage_cfg['lr']}")
+        print(f"Training for {train_cfg['epochs']} epochs, {total_steps} steps")
+        print(f"Batch size: {train_cfg['batch_size']}, LR: {train_cfg['lr']}")
         print("-" * 60)
 
-    for epoch in range(start_epoch, stage_cfg["epochs"]):
+    for epoch in range(start_epoch, train_cfg["epochs"]):
         if distributed:
             train_sampler.set_epoch(epoch)
 
-        cfg["training"]["_grad_clip"] = stage_cfg.get("grad_clip", 1.0)
         train_loss, global_step = train_one_epoch(
             model, train_loader, optimizer, scheduler, scaler,
             epoch, cfg, writer, rank, global_step,
         )
 
         val_loss = float("inf")
-        if val_loader and epoch % cfg["training"].get("val_interval", 1) == 0:
+        if val_loader and epoch % train_cfg.get("val_interval", 1) == 0:
             val_loss = validate(model, val_loader, cfg, rank)
             if rank == 0 and writer:
                 writer.add_scalar("val/loss", val_loss, global_step)
@@ -331,7 +312,7 @@ def main():
                 f"val_loss={val_loss:.4f}, lr={scheduler.get_last_lr()[0]:.2e}"
             )
 
-            if epoch % cfg["training"].get("save_interval", 5) == 0:
+            if epoch % train_cfg.get("save_interval", 5) == 0:
                 save_checkpoint(
                     model, optimizer, scheduler, scaler,
                     epoch, global_step, val_loss,
@@ -349,7 +330,7 @@ def main():
     if rank == 0:
         save_checkpoint(
             model, optimizer, scheduler, scaler,
-            stage_cfg["epochs"] - 1, global_step, val_loss,
+            train_cfg["epochs"] - 1, global_step, val_loss,
             os.path.join(ckpt_dir, "last.pt"),
         )
         print(f"Training complete. Best val loss: {best_val_loss:.4f}")

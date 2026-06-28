@@ -17,7 +17,7 @@ DexVLG bimanual dexterous grasp generation model. Generates language-conditioned
 - `data/` — Dataset and dataloader
 - `utils/` — Rotation math, misc helpers, visualization
 - `configs/` — YAML configuration
-- `train.py` — Two-stage training with DDP
+- `train.py` — Training with DDP
 - `test.py` — Evaluation with metrics
 - `inference.py` — Single-sample demo
 - `test_sanity.py` — Quick model sanity check (no GPU needed)
@@ -28,17 +28,14 @@ DexVLG bimanual dexterous grasp generation model. Generates language-conditioned
 # Run sanity check (verifies all components work)
 python test_sanity.py
 
-# Train stage 1 (full model)
-python train.py --config configs/default.yaml --stage 1
-
-# Train stage 2 (fine-tune flow head only)
-python train.py --config configs/default.yaml --stage 2 --resume outputs/checkpoints/stage1/best.pt
+# Train
+python train.py --config configs/default.yaml
 
 # Evaluate
-python test.py --config configs/default.yaml --checkpoint outputs/checkpoints/stage1/best.pt
+python test.py --config configs/default.yaml --checkpoint outputs/checkpoints/best.pt
 
 # Single inference
-python inference.py --config configs/default.yaml --checkpoint outputs/checkpoints/stage1/best.pt --mesh_path /path/to/mesh.obj --instruction "Grasp the mug"
+python inference.py --config configs/default.yaml --checkpoint outputs/checkpoints/best.pt --mesh_path /path/to/mesh.obj --instruction "Grasp the mug"
 ```
 
 ## Code Conventions
@@ -91,4 +88,4 @@ Local paths (this machine):
 - splits: `/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/{train_v3,test_v3}.json`
 
 Run training with the `dexvlg` conda env:
-`/mnt/conda/jiaxuan/miniconda3/envs/dexvlg/bin/python train.py --config configs/default.yaml --stage 1`
+`/mnt/conda/jiaxuan/miniconda3/envs/dexvlg/bin/python train.py --config configs/default.yaml`

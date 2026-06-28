@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from data.dataset import DexGraspDataset, collate_fn
 from models.dexvlg import DexVLG
-from utils.rotation import rotation_6d_to_matrix, quaternion_to_matrix
+from utils.rotation import rotation_6d_to_matrix
 from utils.misc import set_seed
 
 

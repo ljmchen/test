@@ -218,10 +218,7 @@ class DexVLG(nn.Module):
             max_length=128,
             return_tensors="pt",
         )
-        if isinstance(encoded, dict):
-            encoded = {k: v.to(device) for k, v in encoded.items()}
-        else:
-            encoded = {k: v.to(device) for k, v in encoded.items()}
+        encoded = {k: v.to(device) for k, v in encoded.items()}
 
         output = self.bert(
             input_ids=encoded["input_ids"],

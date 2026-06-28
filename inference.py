@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--instruction", type=str, required=True)
     parser.add_argument("--scale", type=float, default=0.1)
     parser.add_argument("--num_steps", type=int, default=50)
-    parser.add_argument("--n_points", type=int, default=10000)
+    parser.add_argument("--n_points", type=int, default=None)
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--output", type=str, default=None)
     return parser.parse_args()
@@ -49,9 +49,10 @@ def main():
     model.eval()
     print(f"Model loaded from epoch {ckpt.get('epoch', '?')}")
 
-    print(f"Sampling {args.n_points} points from {args.mesh_path}...")
+    n_points = args.n_points or cfg["data"].get("n_points", 4096)
+    print(f"Sampling {n_points} points from {args.mesh_path}...")
     xyz_np, rgb_np = sample_point_cloud_from_mesh(
-        args.mesh_path, args.n_points, args.scale,
+        args.mesh_path, n_points, args.scale,
     )
 
     xyz = torch.from_numpy(xyz_np).unsqueeze(0).cuda()

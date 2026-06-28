@@ -59,7 +59,8 @@
 │   └── default.yaml          # 模型、数据、训练的完整配置
 ├── data/
 │   ├── __init__.py
-│   └── dataset.py            # 双手抓取数据集，网格采样，数据增强
+│   ├── dataset.py            # 双手抓取数据集 (LGBiDex 格式)
+│   └── lgbidex_io.py         # 网格/点云加载，旋转转换，坐标变换
 ├── models/
 │   ├── __init__.py
 │   ├── dexvlg.py             # DexVLG 主模型
@@ -71,7 +72,7 @@
 │   ├── misc.py               # 种子设置、参数统计、AverageMeter
 │   ├── rotation.py           # 四元数 ↔ 旋转矩阵 ↔ 6D 旋转表示
 │   └── visualization.py      # Open3D 点云 + 抓取可视化
-├── train.py                  # 两阶段训练脚本 (DDP + 混合精度)
+├── train.py                  # 训练脚本 (DDP + 混合精度)
 ├── test.py                   # 评估脚本 (多指标)
 ├── inference.py              # 单样本推理 Demo
 ├── test_sanity.py            # 模型完整性检查
@@ -81,24 +82,23 @@
 
 ## 数据格式
 
-训练数据为 JSON 列表，每条记录包含：
+训练数据为 LGBiDex 格式 JSON 列表，每条记录包含：
 
 ```json
 {
     "obj_id": "core-bottle-1a7ba1f4c82e2b4cec1c11c2c1a9a5d3",
-    "obj_pose": [0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0],
+    "obj_pose": [tx, ty, tz, qw, qx, qy, qz],
     "obj_scale": 0.1,
     "cate_id": "bottle",
-    "action": "pour",
-    "contact_area": ["handle", "body"],
-    "dex_grasp_left":  [tx, ty, tz, qw, qx, qy, qz, j0, j1, ..., j21],
-    "dex_grasp_right": [tx, ty, tz, qw, qx, qy, qz, j0, j1, ..., j21],
-    "guidance": "Grasp the bottle with both hands to pour"
+    "guidance": "Grasp the bottle with both hands to pour",
+    "dex_grasp_left":  [tx, ty, tz, ax, ay, az, j0, j1, ..., j21],
+    "dex_grasp_right": [tx, ty, tz, ax, ay, az, j0, j1, ..., j21]
 }
 ```
 
-- `obj_pose`: 物体位姿 `[x, y, z, qw, qx, qy, qz]`（位置 + 四元数）
-- `dex_grasp_*`: 每只手 `[平移3D, 四元数wxyz, 关节角22D]` = 29 维
+- `obj_pose`: 物体位姿 `[x, y, z, qw, qx, qy, qz]`（位置 + 四元数 wxyz）
+- `dex_grasp_*`: 每只手 `[平移3D, 轴角3D, 关节角22D]` = 28 维
+- 点云路径: `{mesh_root}/{obj_id}/pc_part/simplified_part_{N}.ply`
 - 网格路径: `{mesh_root}/{obj_id}/mesh/simplified.obj`
 
 ## 模型细节
@@ -115,11 +115,6 @@
 
 - **训练**: 采样 t ~ U(0,1)，插值 x_t = (1-t)·ε + t·x_1，预测速度场 v = x_1 - ε
 - **推理**: 从高斯噪声出发，Euler ODE 积分 dx/dt = v(x,t,c)，t: 0→1，50 步
-
-### 两阶段训练策略
-
-1. **Stage 1**: 端到端训练全模型 (PointNet++ + BERT + Fusion + Flow Head)
-2. **Stage 2**: 冻结视觉-语言骨干网络，仅微调 Flow-Matching Head
 
 ## 评估指标
 

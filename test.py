@@ -19,9 +19,32 @@ import yaml
 from tqdm import tqdm
 
 from data.dataset import DexGraspDataset, collate_fn
+from data.pose_normalizer import build_hand_normalizers
 from models.dexvlg import DexVLG
 from utils.rotation import rotation_6d_to_matrix
 from utils.misc import set_seed
+
+
+def denormalize_predictions(
+    pred_poses: dict, gt_poses: torch.Tensor, normalizers: dict,
+    trans_dim: int = 3, rot_dim: int = 6,
+) -> tuple[dict, torch.Tensor]:
+    """Map normalized model outputs + gt back to real units (meters/radians)."""
+    for i, hand in enumerate(["left", "right"]):
+        pose = torch.cat(
+            [
+                pred_poses[f"{hand}_translation"].float(),
+                pred_poses[f"{hand}_rotation_6d"].float(),
+                pred_poses[f"{hand}_joints"].float(),
+            ],
+            dim=-1,
+        )
+        pose = normalizers[hand].denormalize_pose(pose)
+        pred_poses[f"{hand}_translation"] = pose[:, :trans_dim]
+        pred_poses[f"{hand}_rotation_6d"] = pose[:, trans_dim : trans_dim + rot_dim]
+        pred_poses[f"{hand}_joints"] = pose[:, trans_dim + rot_dim :]
+        gt_poses[:, i] = normalizers[hand].denormalize_pose(gt_poses[:, i].float())
+    return pred_poses, gt_poses
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,6 +130,7 @@ def evaluate(
     dataloader: torch.utils.data.DataLoader,
     num_steps: int,
     save_predictions: bool = False,
+    normalizers: dict | None = None,
 ) -> tuple[dict[str, float], list[dict]]:
     """Run evaluation on a dataset.
 
@@ -128,6 +152,9 @@ def evaluate(
 
         with autocast("cuda", enabled=True):
             pred_poses = model.sample(xyz, rgb, texts, num_steps=num_steps)
+
+        if normalizers is not None:
+            pred_poses, gt_poses = denormalize_predictions(pred_poses, gt_poses, normalizers)
 
         batch_metrics = compute_metrics(pred_poses, gt_poses)
 
@@ -181,6 +208,7 @@ def main():
         point_cloud_file_points=data_cfg.get("point_cloud_file_points", None),
         center_on_object=data_cfg.get("center_on_object", True),
         obj_pose_quaternion_order=data_cfg.get("obj_pose_quaternion_order", "wxyz"),
+        normalization=data_cfg.get("normalization", None),
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
@@ -191,9 +219,13 @@ def main():
         pin_memory=True,
     )
 
+    normalizers = build_hand_normalizers(
+        data_cfg.get("normalization", None), joint_dim=cfg["model"].get("joint_dim", 22)
+    )
+
     print(f"Evaluating on {len(test_dataset)} samples with {args.num_steps} ODE steps...")
     metrics, predictions = evaluate(
-        model, test_loader, args.num_steps, args.save_predictions,
+        model, test_loader, args.num_steps, args.save_predictions, normalizers,
     )
 
     print("\n" + "=" * 60)

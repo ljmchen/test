@@ -27,3 +27,6 @@ Thumbs.db
 .env
 .venv/
 venv/
+
+pretrained_models/
+.setup_logs/

@@ -182,21 +182,27 @@ class PointNet2Encoder(nn.Module):
         """
         super().__init__()
         self.num_output_tokens = num_output_tokens
-        feature_dim = in_channels - 3
+        self.feature_dim = in_channels - 3
 
-        self.sa1 = SetAbstraction(512, 0.1, 32, feature_dim, [64, 64, 128])
+        self.sa1 = SetAbstraction(512, 0.1, 32, self.feature_dim, [64, 64, 128])
         self.sa2 = SetAbstraction(128, 0.2, 64, 128, [128, 128, 256])
         self.sa3 = SetAbstraction(num_output_tokens, 0.4, 64, 256, [256, 256, output_dim])
 
-    def forward(self, xyz: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, xyz: torch.Tensor, features: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Args:
             xyz: Point positions, shape (B, N, 3).
-            features: Point features (e.g., RGB), shape (B, N, C).
+            features: Point features (e.g., RGB), shape (B, N, C). Ignored when
+                the encoder is configured xyz-only (in_channels == 3), so the
+                caller may pass colors unconditionally.
 
         Returns:
             Token features, shape (B, num_output_tokens, output_dim).
         """
+        if self.feature_dim == 0:
+            features = None  # xyz-only: drop colors to match the first SA layer
         xyz1, feat1 = self.sa1(xyz, features)
         xyz2, feat2 = self.sa2(xyz1, feat1)
         _, feat3 = self.sa3(xyz2, feat2)

@@ -56,6 +56,7 @@ from data.lgbidex_io import (
     shift_pose_translation,
     transform_points,
 )
+from data.pose_normalizer import build_hand_normalizers
 
 HAND_SIDES = ("left", "right")
 SINGLE_HAND_RAW_POSE_DIM = 28  # [trans(3), axis_angle(3), joints(22)]
@@ -107,6 +108,7 @@ class DexGraspDataset(Dataset):
         point_cloud_file_points: int | str | None = None,
         center_on_object: bool = True,
         obj_pose_quaternion_order: str = "wxyz",
+        normalization: dict | None = None,
     ):
         """
         Args:
@@ -123,6 +125,10 @@ class DexGraspDataset(Dataset):
             point_cloud_file_points: PLY point count tag (defaults to n_points).
             center_on_object: Center point cloud + grasps on the object.
             obj_pose_quaternion_order: ``wxyz`` | ``xyzw``.
+            normalization: ``{"enabled": bool, "mode": "minmax11"}``. When
+                enabled, target poses are min-max normalized to ``[-1, 1]``
+                per hand (translation + joints); the flow model then trains on
+                normalized poses and callers must denormalize predictions.
         """
         if point_cloud_source not in {"auto", "colored_ply", "mesh_sample"}:
             raise ValueError(f"Unsupported point_cloud_source '{point_cloud_source}'.")
@@ -144,6 +150,8 @@ class DexGraspDataset(Dataset):
         self.point_cloud_file_points = str(self.n_points if point_cloud_file_points is None else point_cloud_file_points)
         self.center_on_object = bool(center_on_object)
         self.obj_pose_quaternion_order = obj_pose_quaternion_order
+        # per-hand pose normalizers (None when normalization disabled)
+        self.normalizers = build_hand_normalizers(normalization, joint_dim=self.joint_dim)
 
         # Cache the raw (pre-transform) per-object geometry so the cache size is
         # bounded by the number of unique objects, not the number of records.
@@ -274,7 +282,10 @@ class DexGraspDataset(Dataset):
     def _build_hand_pose(self, record: dict, side: str) -> torch.Tensor:
         raw = torch.tensor(record[f"dex_grasp_{side}"], dtype=torch.float32)
         centered = self._center_hand_pose(raw, record)
-        return self._to_target_pose(centered)
+        pose = self._to_target_pose(centered)
+        if self.normalizers is not None:
+            pose = self.normalizers[side].normalize_pose(pose)
+        return pose
 
     # ─── Augmentation (pose-preserving) ───────────────────────────────────
 
@@ -291,6 +302,34 @@ class DexGraspDataset(Dataset):
         rgb = torch.clamp(rgb + torch.randn_like(rgb) * 0.02, 0.0, 1.0)
         return xyz, rgb
 
+    def _build_instruction(self, record: dict) -> str:
+        guidance = str(record.get("guidance", "")).strip()
+        if not guidance:
+            action = record.get("action", "grasp")
+            cate = record.get("cate_id", "object")
+            guidance = f"{action} the {cate}"
+        return guidance
+
+    def get_inference_item(self, idx: int) -> dict:
+        """Per-record inputs + world-restore offsets for batched inference.
+
+        Returns the point cloud, instruction, and the object translation /
+        bbox-center offset needed to map object-centered predictions back to
+        the world frame (mirrors dexvlm's ``get_visualization_item``).
+        """
+        record = self.data[idx]
+        xyz, rgb = self._build_point_cloud(record)
+        translation, _, _ = self._build_object_pose(record)
+        center_offset = self._build_object_center_offset(record)
+        return {
+            "xyz": xyz,
+            "rgb": rgb,
+            "text": self._build_instruction(record),
+            "object_translation": translation,
+            "object_center_offset": center_offset,
+            "record": record,
+        }
+
     def __getitem__(self, idx: int) -> dict:
         record = self.data[idx]
         xyz, rgb = self._build_point_cloud(record)
@@ -300,11 +339,7 @@ class DexGraspDataset(Dataset):
         pose_left = self._build_hand_pose(record, "left")
         pose_right = self._build_hand_pose(record, "right")
 
-        guidance = str(record.get("guidance", "")).strip()
-        if not guidance:
-            action = record.get("action", "grasp")
-            cate = record.get("cate_id", "object")
-            guidance = f"{action} the {cate}"
+        guidance = self._build_instruction(record)
 
         return {
             "xyz": xyz,

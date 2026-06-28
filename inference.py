@@ -18,6 +18,7 @@ import torch
 import yaml
 
 from data.dataset import sample_point_cloud_from_mesh
+from data.pose_normalizer import build_hand_normalizers
 from models.dexvlg import DexVLG
 from utils.rotation import rotation_6d_to_quaternion
 from utils.visualization import create_hand_skeleton, visualize_grasp
@@ -63,6 +64,25 @@ def main():
 
     with torch.no_grad():
         result = model.sample(xyz, rgb, [args.instruction], num_steps=args.num_steps)
+
+    # Map normalized model outputs back to real units when normalization is on.
+    normalizers = build_hand_normalizers(
+        cfg["data"].get("normalization", None), joint_dim=cfg["model"].get("joint_dim", 22)
+    )
+    if normalizers is not None:
+        for hand in ["left", "right"]:
+            pose = torch.cat(
+                [
+                    result[f"{hand}_translation"].float(),
+                    result[f"{hand}_rotation_6d"].float(),
+                    result[f"{hand}_joints"].float(),
+                ],
+                dim=-1,
+            )
+            pose = normalizers[hand].denormalize_pose(pose)
+            result[f"{hand}_translation"] = pose[:, :3]
+            result[f"{hand}_rotation_6d"] = pose[:, 3:9]
+            result[f"{hand}_joints"] = pose[:, 9:]
 
     print("\n=== Predicted Grasp Poses ===")
     for hand in ["left", "right"]:

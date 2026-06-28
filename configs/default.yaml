@@ -4,15 +4,19 @@
 # ─── Model ────────────────────────────────────────────────────────────
 model:
   # Point cloud encoder (PointNet++ replacing Uni3D)
-  # 6 = xyz(3) + rgb(3): the model always feeds colored point clouds
-  # (encode_condition -> pc_encoder(xyz, rgb)), so the encoder must accept 6ch.
-  pc_in_channels: 6          # xyz + rgb
+  # 3 = xyz-only (encoder drops the rgb passed by encode_condition);
+  # 6 = xyz + rgb. PointNet2Encoder adapts to this value automatically.
+  pc_in_channels: 3          # xyz-only
   pc_feature_dim: 256
   num_pc_tokens: 64
 
-  # Language model (BERT replacing Florence-2)
-  bert_model: "bert-base-uncased"
-  bert_dim: 768
+  # Language model. language_backbone: bert (default) | modernbert.
+  # ModernBERT (2024, bidirectional, hidden_size 768 == bert_dim) is a drop-in:
+  language_backbone: modernbert
+  bert_model: "pretrained_models/ModernBERT-base"
+  # language_backbone: bert
+  # bert_model: "pretrained_models/bert-base-uncased"
+  bert_dim: 768               # must equal the encoder's hidden_size (BERT/ModernBERT-base = 768)
   freeze_bert_embeddings: false
 
   # Fusion transformer
@@ -29,24 +33,33 @@ model:
 # ─── Data ─────────────────────────────────────────────────────────────
 # LGBiDex bimanual format (mirrors dexvlm's LgbiDexDataset input processing).
 data:
-  train_data: "/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/train_v3.json"
-  val_data: "/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/test_v3.json"
-  test_data: "/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/test_v3.json"
-  mesh_root: "/home/jiaxuan/wowowowo/slai/Dataset/MeshProcess/assets/object/oakink_obj/processed_data"
+  # train_data: "/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/train_v3.json"
+  # val_data: "/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/test_v3.json"
+  # test_data: "/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/test_v3.json"
+  # mesh_root: "/home/jiaxuan/wowowowo/slai/Dataset/MeshProcess/assets/object/oakink_obj/processed_data"
+  train_data: "/mnt/afs/L202500241/asserts/lgbidex/pose_data/train_v3_sim3.json"
+  val_data: "/mnt/afs/L202500241/asserts/lgbidex/pose_data/test_v3_sim3.json"
+  test_data: "/mnt/afs/L202500241/asserts/lgbidex/pose_data/test_v3_sim3.json"
+  mesh_root: "/mnt/afs/L202500241/asserts/lgbidex/oakink_obj/processed_data"
   n_points: 4096                    # Must match the PLY tag simplified_part_{N}.ply
   augment: false                    # Rotation aug breaks PC/grasp correspondence; keep off
   # Point cloud sourcing (see data/dataset.py)
-  point_cloud_source: auto          # auto | colored_ply | mesh_sample
-  point_cloud_color_mode: real      # real (use PLY RGB) | fill (constant)
+  point_cloud_source: mesh_sample          # auto | colored_ply | mesh_sample
+  point_cloud_color_mode: fill      # real (use PLY RGB) | fill (constant)
   point_cloud_color_fill: 0.4
   # Object-centered coordinate convention (matches dexvlm)
   center_on_object: true
   obj_pose_quaternion_order: wxyz
+  # Per-hand min-max[-1,1] pose normalization (translation+joints); matches dexvlm.
+  # Targets are normalized for training; validation/inference denormalize back.
+  normalization:
+    enabled: true
+    mode: minmax11
 
 # ─── Training ─────────────────────────────────────────────────────────
 training:
-  epochs: 50
-  batch_size: 32
+  epochs: 60
+  batch_size: 128
   lr: 1.0e-4
   weight_decay: 1.0e-4
   warmup_steps: 1000
@@ -54,17 +67,26 @@ training:
 
   optimizer: "adamw"
   scheduler: "cosine"
-  num_workers: 4
+  num_workers: 8
+  persistent_workers: true    # keep workers + warm point-cloud cache across epochs
+  prefetch_factor: 2          # batches prefetched per worker (overlaps I/O with GPU)
   seed: 42
   fp16: true
-  log_interval: 50
-  save_interval: 5
-  val_interval: 1
+  log_interval: 1000           # train loss written to console + train.log every N steps
+  val_interval: 1             # sampling-based validation every N epochs (not steps)
+  val_max_batches: 0         # cap validation to N batches per run (0 = full val set)
+  keep_best_k: 4              # keep only the best-K checkpoints by val score
+  # Per-component validation metric. true -> MSE (mean squared error);
+  # false -> physical metric (translation L2 distance / rotation geodesic angle / joint L1).
+  val_loss_mse:
+    translation: true
+    rotation: true
+    joint: true
 
 # ─── Inference ────────────────────────────────────────────────────────
 inference:
   num_steps: 10               # Euler ODE integration steps
-  batch_size: 64
+  batch_size: 256
 
 # ─── Paths ────────────────────────────────────────────────────────────
 paths:

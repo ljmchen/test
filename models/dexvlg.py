@@ -13,6 +13,7 @@ Supports bimanual dexterous grasping with 2 query tokens (left/right hand).
 """
 
 import logging
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -118,29 +119,89 @@ class FusionTransformer(nn.Module):
         return self.norm(fused)
 
 
+def _resolve_pretrained_path(bert_name: str) -> tuple[str, bool]:
+    """Resolve repo-relative pretrained model paths before falling back to HF ids."""
+    path = Path(bert_name).expanduser()
+    if path.is_dir():
+        return str(path), True
+    if not path.is_absolute():
+        repo_root = Path(__file__).resolve().parents[1]
+        repo_path = repo_root / path
+        if repo_path.is_dir():
+            return str(repo_path), True
+    return bert_name, False
+
+
+def _random_bert(bert_dim: int):
+    """Random-init BERT + SimpleTokenizer fallback (offline / weights unavailable)."""
+    from transformers import BertConfig, BertModel
+
+    config = BertConfig(
+        vocab_size=30522,
+        hidden_size=bert_dim,
+        num_attention_heads=12,
+        num_hidden_layers=6,
+        intermediate_size=bert_dim * 4,
+    )
+    return SimpleTokenizer(), BertModel(config)
+
+
 def _load_bert(bert_name: str, bert_dim: int):
     """Load BERT model and tokenizer, falling back to random init if needed."""
+    pretrained_path, local_only = _resolve_pretrained_path(bert_name)
     try:
         from transformers import BertModel, BertTokenizer
 
-        tokenizer = BertTokenizer.from_pretrained(bert_name)
-        bert = BertModel.from_pretrained(bert_name)
-        logger.info("Loaded pretrained BERT from '%s'", bert_name)
+        tokenizer = BertTokenizer.from_pretrained(
+            pretrained_path, local_files_only=local_only
+        )
+        bert = BertModel.from_pretrained(pretrained_path, local_files_only=local_only)
+        logger.info("Loaded pretrained BERT from '%s'", pretrained_path)
         return tokenizer, bert
     except Exception as e:
         logger.warning(
-            "Could not load pretrained '%s' (%s), using random init", bert_name, e
+            "Could not load pretrained '%s' (%s), using random init",
+            pretrained_path,
+            e,
         )
-        from transformers import BertConfig, BertModel
+        return _random_bert(bert_dim)
 
-        config = BertConfig(
-            vocab_size=30522,
-            hidden_size=bert_dim,
-            num_attention_heads=12,
-            num_hidden_layers=6,
-            intermediate_size=bert_dim * 4,
+
+def _load_modernbert(model_name: str, hidden_dim: int):
+    """Load ModernBERT (a modern bidirectional encoder) via Auto* classes.
+
+    Interface matches BERT (tokenizer -> input_ids/attention_mask, model ->
+    last_hidden_state), so it drops straight into ``encode_language``. Falls back
+    to a random BERT when the weights are unavailable (offline / not downloaded).
+    """
+    pretrained_path, local_only = _resolve_pretrained_path(model_name)
+    try:
+        from transformers import AutoModel, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_path, local_files_only=local_only)
+        model = AutoModel.from_pretrained(pretrained_path, local_files_only=local_only)
+        got = int(getattr(model.config, "hidden_size", hidden_dim))
+        if got != hidden_dim:
+            logger.warning(
+                "ModernBERT hidden_size=%d != configured model.bert_dim=%d; "
+                "set bert_dim=%d to match (projector/fusion use bert_dim).",
+                got, hidden_dim, got,
+            )
+        logger.info("Loaded ModernBERT from '%s' (hidden_size=%d)", pretrained_path, got)
+        return tokenizer, model
+    except Exception as e:
+        logger.warning(
+            "Could not load ModernBERT '%s' (%s), using random BERT", pretrained_path, e
         )
-        return SimpleTokenizer(), BertModel(config)
+        return _random_bert(hidden_dim)
+
+
+def _load_language_model(backbone: str, model_name: str, hidden_dim: int):
+    """Dispatch to the configured language backbone (BERT default, or ModernBERT)."""
+    backbone = (backbone or "bert").lower().replace("-", "").replace("_", "")
+    if backbone in ("modernbert", "modern"):
+        return _load_modernbert(model_name, hidden_dim)
+    return _load_bert(model_name, hidden_dim)
 
 
 class DexVLG(nn.Module):
@@ -167,6 +228,7 @@ class DexVLG(nn.Module):
         fusion_depth = cfg.get("fusion_depth", 4)
         num_pc_tokens = cfg.get("num_pc_tokens", 64)
         joint_dim = cfg.get("joint_dim", 22)
+        language_backbone = cfg.get("language_backbone", "bert")
         bert_name = cfg.get("bert_model", "bert-base-uncased")
         freeze_bert = cfg.get("freeze_bert_embeddings", False)
 
@@ -188,11 +250,13 @@ class DexVLG(nn.Module):
             nn.Linear(bert_dim, bert_dim),
         )
 
-        self.tokenizer, self.bert = _load_bert(bert_name, bert_dim)
+        self.tokenizer, self.bert = _load_language_model(language_backbone, bert_name, bert_dim)
 
         if freeze_bert:
-            for p in self.bert.embeddings.parameters():
-                p.requires_grad = False
+            embeddings = getattr(self.bert, "embeddings", None)
+            if embeddings is not None:
+                for p in embeddings.parameters():
+                    p.requires_grad = False
 
         self.fusion = FusionTransformer(
             dim=bert_dim, depth=fusion_depth, num_heads=flow_heads,

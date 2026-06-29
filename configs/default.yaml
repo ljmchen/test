@@ -75,7 +75,7 @@ training:
   log_interval: 1000           # train loss written to console + train.log every N steps
   val_interval: 1             # sampling-based validation every N epochs (not steps)
   val_max_batches: 0         # cap validation to N batches per run (0 = full val set)
-  keep_best_k: 4              # keep only the best-K checkpoints by val score
+  keep_best_k: 3              # keep only the best-K checkpoints by val score
   # Per-component validation metric. true -> MSE (mean squared error);
   # false -> physical metric (translation L2 distance / rotation geodesic angle / joint L1).
   val_loss_mse:

@@ -58,6 +58,17 @@ def hand_pose_to_raw28(
     return torch.cat([translation, axis_angle, joints], dim=-1)
 
 
+def _record_value(record: dict, key: str) -> str:
+    """Fetch a dedup-key value, tolerating the guidance/guidence spelling."""
+    if key in ("guidance", "guidence"):
+        return str(record.get("guidance", record.get("guidence", "")))
+    return str(record.get(key, ""))
+
+
+def _record_key(record: dict, keys: list[str]) -> tuple:
+    return tuple(_record_value(record, k) for k in keys)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DexVLG dataset inference -> predictions JSON")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
@@ -71,6 +82,16 @@ def parse_args() -> argparse.Namespace:
                         help="Euler ODE steps (default: config inference.num_steps or 10).")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--dedup-by", type=str, default="",
+        help="Comma-separated record keys to dedup inputs by (e.g. obj_id,pose_id,guidance). "
+             "Empty = no dedup (one inference per record). 'guidance' also matches 'guidence'.",
+    )
+    parser.add_argument(
+        "--samples-per-combo", type=int, default=1,
+        help="Number of grasps to sample per (deduped) combination. Each becomes a "
+             "separate output record with its own candidate_idx (0..N-1).",
+    )
     return parser.parse_args()
 
 
@@ -117,14 +138,35 @@ def main() -> None:
     model.eval()
 
     n = len(dataset)
+    # Optional dedup: keep the first record per (dedup-by) combination.
+    dedup_keys = [k.strip() for k in args.dedup_by.split(",") if k.strip()]
+    if dedup_keys:
+        seen: dict[tuple, int] = {}
+        for i in range(n):
+            key = _record_key(dataset.data[i], dedup_keys)
+            if key not in seen:
+                seen[key] = i
+        unique_indices = list(seen.values())
+    else:
+        unique_indices = list(range(n))
+
+    samples_per_combo = max(1, int(args.samples_per_combo))
+    # Work list: (dataset_idx, candidate_idx). Flow matching samples from random
+    # noise, so the same input replicated N times yields N distinct grasps.
+    work = [(idx, c) for idx in unique_indices for c in range(samples_per_combo)]
+
     print(f"[info] split={args.split} path={split_path} records={n}")
+    print(f"[info] dedup_by={dedup_keys or 'none'} unique_combos={len(unique_indices)} "
+          f"samples_per_combo={samples_per_combo} -> {len(work)} inferences")
     print(f"[info] device={device_name} batch_size={args.batch_size} num_steps={num_steps} "
           f"normalized={normalizers is not None} center_on_object={center_on_object}")
 
+    total = len(work)
     results: list[dict] = []
-    for start in range(0, n, args.batch_size):
-        end = min(start + args.batch_size, n)
-        items = [dataset.get_inference_item(i) for i in range(start, end)]
+    for start in range(0, total, args.batch_size):
+        chunk = work[start : start + args.batch_size]
+        items = [dataset.get_inference_item(idx) for idx, _ in chunk]
+        cand_ids = [c for _, c in chunk]
         xyz = torch.stack([it["xyz"] for it in items]).to(device)
         rgb = torch.stack([it["rgb"] for it in items]).to(device)
         texts = [it["text"] for it in items]
@@ -163,6 +205,9 @@ def main() -> None:
             out["pred_left"] = left.tolist()
             out["pred_right"] = right.tolist()
             out["pred_pose_frame"] = "world"
+            # candidate index so downstream (prepare_bench_data.py) groups the N
+            # samples of one combination as N variants of the same sample.
+            out["candidate_idx"] = int(cand_ids[i])
             out["_dexvlg_inference"] = {
                 "prediction_fields": ["pred_left", "pred_right"],
                 "pred_pose_format": "translation_axis_angle_joints_28",
@@ -170,11 +215,12 @@ def main() -> None:
                 "center_on_object_input": center_on_object,
                 "normalized": normalizers is not None,
                 "num_steps": int(num_steps),
+                "candidate_idx": int(cand_ids[i]),
                 "checkpoint": str(Path(args.checkpoint).resolve()),
             }
             results.append(out)
 
-        print(f"  [{end}/{n}] done", end="\r", flush=True)
+        print(f"  [{min(start + args.batch_size, total)}/{total}] done", end="\r", flush=True)
     print()
 
     output_path = Path(args.output)

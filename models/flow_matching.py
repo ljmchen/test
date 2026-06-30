@@ -80,6 +80,7 @@ class FlowMatchingTransformer(nn.Module):
         cond_dim: int = 768,
         time_dim: int = 256,
         mlp_ratio: float = 4.0,
+        hand_interaction: dict | None = None,
     ):
         """
         Args:
@@ -91,6 +92,7 @@ class FlowMatchingTransformer(nn.Module):
             cond_dim: Dimension of condition tokens from the backbone.
             time_dim: Dimension of timestep embedding.
             mlp_ratio: MLP expansion ratio.
+            hand_interaction: Optional hand interaction config dict.
         """
         super().__init__()
         self.pose_dim = pose_dim
@@ -111,6 +113,18 @@ class FlowMatchingTransformer(nn.Module):
 
         self.final_norm = nn.LayerNorm(dim)
         self.output_proj = nn.Linear(dim, pose_dim)
+
+        hi = hand_interaction or {}
+        self.use_hand_type_embed = bool(hi.get("enabled", False))
+        if self.use_hand_type_embed:
+            self.hand_type_embed = nn.Embedding(num_queries, dim)
+            if bool(hi.get("cross_hand_attn", False)):
+                self.cross_hand_norm = nn.LayerNorm(dim)
+                self.cross_hand_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+            else:
+                self.cross_hand_attn = None
+        else:
+            self.cross_hand_attn = None
 
     def forward(
         self,
@@ -137,10 +151,16 @@ class FlowMatchingTransformer(nn.Module):
         time_emb = self.time_mlp(time_emb)
 
         x = self.input_proj(x_t) + self.query_pos[:, : x_t.shape[1]]
+        if self.use_hand_type_embed:
+            hand_ids = torch.arange(x.shape[1], device=x.device)
+            x = x + self.hand_type_embed(hand_ids).unsqueeze(0)
         cond = self.cond_proj(cond_tokens)
 
         for block in self.blocks:
             x = block(x, cond, time_emb)
+
+        if self.cross_hand_attn is not None:
+            x = x + self.cross_hand_attn(*([self.cross_hand_norm(x)] * 3))[0]
 
         x = self.final_norm(x)
         v = self.output_proj(x)

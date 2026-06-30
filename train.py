@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import copy
 import logging
 import math
 import os
@@ -38,6 +39,31 @@ def geodesic_angle(pred_rot6d: torch.Tensor, gt_rot6d: torch.Tensor) -> torch.Te
     trace = r_rel.diagonal(dim1=-2, dim2=-1).sum(-1)
     cos_angle = torch.clamp((trace - 1.0) / 2.0, -1.0, 1.0)
     return torch.acos(cos_angle)
+
+
+class _EMA:
+    """Exponential Moving Average of model parameters."""
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model)
+        self.shadow.eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        src = model.module if hasattr(model, "module") else model
+        for s_param, m_param in zip(self.shadow.parameters(), src.parameters()):
+            s_param.lerp_(m_param.data, 1.0 - self.decay)
+        for s_buf, m_buf in zip(self.shadow.buffers(), src.buffers()):
+            s_buf.copy_(m_buf)
+
+    def state_dict(self) -> dict:
+        return self.shadow.state_dict()
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.shadow.load_state_dict(state_dict)
 
 
 def parse_args() -> argparse.Namespace:
@@ -152,6 +178,7 @@ def train_one_epoch(
     scaler = vc["scaler"]
 
     model.train()
+    ema = vc.get("ema")
     loss_meter = AverageMeter()
     amp_enabled, amp_dtype, _ = get_amp_settings(cfg["training"])
     grad_clip = cfg["training"].get("grad_clip", 1.0)
@@ -189,6 +216,8 @@ def train_one_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         scaler.step(optimizer)
         scaler.update()
+        if ema is not None:
+            ema.update(model)
         scheduler.step()
 
         loss_val = loss.item()
@@ -216,6 +245,8 @@ def run_validation(vc: dict, epoch: int, global_step: int) -> None:
     Collective: every rank must call this together. Only rank 0 logs/saves.
     """
     model = vc["model"]
+    ema = vc.get("ema")
+    val_model = ema.shadow if ema is not None else model
     # Build (once, cached) the group->GT-candidates map for group-internal matching.
     group_candidates = None
     if bool(vc["cfg"]["training"].get("val_group_min", False)) and vc["val_loader"] is not None:
@@ -230,7 +261,7 @@ def run_validation(vc: dict, epoch: int, global_step: int) -> None:
                 )
         group_candidates = vc["group_candidates"]
     val_metrics = validate(
-        model, vc["val_loader"], vc["cfg"], vc["rank"], vc["distributed"],
+        val_model, vc["val_loader"], vc["cfg"], vc["rank"], vc["distributed"],
         normalizers=vc.get("normalizers"), group_candidates=group_candidates,
     )
     model.train()  # restore training mode on every rank before continuing
@@ -250,7 +281,7 @@ def run_validation(vc: dict, epoch: int, global_step: int) -> None:
         vc["best_registry"], score, vc["keep_best_k"], vc["ckpt_dir"], epoch,
         lambda path: save_checkpoint(
             model, vc["optimizer"], vc["scheduler"], vc["scaler"],
-            epoch, global_step, score, path, val_metrics,
+            epoch, global_step, score, path, val_metrics, ema=vc.get("ema"),
         ),
     )
     msg = (
@@ -387,24 +418,43 @@ def validate(
             pred_real[hand] = pp
 
         if group_candidates is not None:
-            # group-internal best match: each prediction is scored against the
-            # closest GT among ALL grasps in its (obj_id,pose_id,guidance) group.
             group_ids = batch["group_ids"]
-            for b in range(bsz):
-                cand = group_candidates.get(group_ids[b])
-                if cand is None:
-                    continue
+            dev = pred_real["left"].device
+            pose_dim_v = pred_real["left"].shape[-1]
+            max_k = max(
+                (group_candidates[g]["left"].shape[0] for g in group_ids if g in group_candidates),
+                default=0,
+            )
+            if max_k > 0:
+                left_cands = pred_real["left"].new_zeros(bsz, max_k, pose_dim_v)
+                right_cands = pred_real["left"].new_zeros(bsz, max_k, pose_dim_v)
+                cand_mask = torch.zeros(bsz, max_k, dtype=torch.bool, device=dev)
+                valid = torch.zeros(bsz, dtype=torch.bool, device=dev)
+                for b in range(bsz):
+                    cand = group_candidates.get(group_ids[b])
+                    if cand is None:
+                        continue
+                    k = cand["left"].shape[0]
+                    left_cands[b, :k] = cand["left"]
+                    right_cands[b, :k] = cand["right"]
+                    cand_mask[b, :k] = True
+                    valid[b] = True
+                v = valid
                 tl, rl, jl = pose_component_errors(
-                    pred_real["left"][b], cand["left"], trans_dim, rot_dim, mse_trans, mse_rot, mse_joint
+                    pred_real["left"][v].unsqueeze(1), left_cands[v],
+                    trans_dim, rot_dim, mse_trans, mse_rot, mse_joint,
                 )
                 tr, rr, jr = pose_component_errors(
-                    pred_real["right"][b], cand["right"], trans_dim, rot_dim, mse_trans, mse_rot, mse_joint
+                    pred_real["right"][v].unsqueeze(1), right_cands[v],
+                    trans_dim, rot_dim, mse_trans, mse_rot, mse_joint,
                 )
-                k = torch.argmin((tl + rl + jl) + (tr + rr + jr))  # best bimanual candidate
-                sums[0] += tl[k] + tr[k]
-                sums[1] += rl[k] + rr[k]
-                sums[2] += jl[k] + jr[k]
-                count += 2  # two hands
+                combined = (tl + rl + jl) + (tr + rr + jr)
+                combined.masked_fill_(~cand_mask[v], float("inf"))
+                best = combined.argmin(dim=-1, keepdim=True)
+                sums[0] += tl.gather(1, best).sum() + tr.gather(1, best).sum()
+                sums[1] += rl.gather(1, best).sum() + rr.gather(1, best).sum()
+                sums[2] += jl.gather(1, best).sum() + jr.gather(1, best).sum()
+                count += 2 * v.sum()
         else:
             # one-to-one: each prediction is scored against its own record's GT.
             for i, hand in enumerate(("left", "right")):
@@ -440,21 +490,22 @@ def save_checkpoint(
     val_loss: float,
     path: str,
     val_metrics: dict[str, float] | None = None,
+    ema: _EMA | None = None,
 ) -> None:
     state = model.module if hasattr(model, "module") else model
-    torch.save(
-        {
-            "epoch": epoch,
-            "global_step": global_step,
-            "model_state_dict": state.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "val_loss": val_loss,
-            "val_metrics": val_metrics or {},
-        },
-        path,
-    )
+    ckpt = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state_dict": state.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "val_loss": val_loss,
+        "val_metrics": val_metrics or {},
+    }
+    if ema is not None:
+        ckpt["ema_state_dict"] = ema.state_dict()
+    torch.save(ckpt, path)
 
 
 _BEST_CKPT_RE = re.compile(r"best_e\d+_s([0-9]+\.[0-9]+)\.pt$")
@@ -545,6 +596,16 @@ def main():
 
     if distributed:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+
+    ema_cfg = train_cfg.get("ema", {}) or {}
+    use_ema = bool(ema_cfg.get("enabled", False))
+    ema = None
+    if use_ema:
+        ema_decay = float(ema_cfg.get("decay", 0.9999))
+        base = model.module if hasattr(model, "module") else model
+        ema = _EMA(base, decay=ema_decay)
+        if rank == 0:
+            logger.info(f"EMA enabled: decay={ema_decay}")
 
     data_cfg = cfg["data"]
     dataset_kwargs = dict(
@@ -667,6 +728,8 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         scaler.load_state_dict(ckpt["scaler_state_dict"])
+        if ema is not None and "ema_state_dict" in ckpt:
+            ema.load_state_dict(ckpt["ema_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt["global_step"]
         if rank == 0:
@@ -695,6 +758,7 @@ def main():
         "best_registry": best_registry,
         "val_interval": val_interval,
         "normalizers": normalizers,
+        "ema": ema,
     }
 
     if rank == 0:
@@ -749,7 +813,7 @@ def main():
         save_checkpoint(
             model, optimizer, scheduler, scaler,
             train_cfg["epochs"] - 1, global_step, best_score,
-            os.path.join(ckpt_dir, "last.pt"),
+            os.path.join(ckpt_dir, "last.pt"), ema=ema,
         )
         logger.info("Training complete.")
         if best_registry:

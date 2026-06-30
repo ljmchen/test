@@ -37,6 +37,26 @@ model:
     rotation: 6.0
     joint: 1.0
 
+  # Hand interaction: per-hand type embeddings + optional cross-hand attention
+  # in the flow-matching transformer. enabled=false -> identical to baseline.
+  hand_interaction:
+    enabled: false
+    cross_hand_attn: false
+
+  # Classifier-Free Guidance (CFG). drop_prob > 0 trains with random condition
+  # dropout; guidance_scale != 1.0 amplifies the conditional signal at inference.
+  # Both at defaults (0 / 1.0) -> identical to baseline (no extra parameters).
+  cfg:
+    drop_prob: 0.0
+    guidance_scale: 1.0
+
+  # Implicit affordance attention. Scores fused PC tokens by task relevance,
+  # creates a weighted summary token appended to the condition sequence.
+  # No separate loss; gradients flow through the flow-matching objective.
+  affordance:
+    enabled: false
+    hidden_dim: 192
+
 # ─── Data ─────────────────────────────────────────────────────────────
 # LGBiDex bimanual format (mirrors dexvlm's LgbiDexDataset input processing).
 data:
@@ -85,6 +105,13 @@ training:
   persistent_workers: true    # keep workers + warm point-cloud cache across epochs
   prefetch_factor: 4          # batches prefetched per worker (overlaps I/O with GPU)
   seed: 42
+
+  # Exponential Moving Average of model weights for validation/inference.
+  # enabled=false -> no EMA, identical to baseline.
+  ema:
+    enabled: false
+    decay: 0.9999
+
   # AMP precision: bf16 | fp16 | fp32. bf16 RECOMMENDED on H100 / with ModernBERT
   # (fp16 can overflow -> inf -> poisons BatchNorm stats -> permanent NaN). bf16
   # disables the grad scaler (not needed). `fp16: true/false` kept as a fallback

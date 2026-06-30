@@ -297,6 +297,7 @@ class DexVLG(nn.Module):
             dim=bert_dim, depth=fusion_depth, num_heads=flow_heads,
         )
 
+        hand_interaction = cfg.get("hand_interaction", None)
         self.flow_transformer = FlowMatchingTransformer(
             pose_dim=self.pose_dim,
             num_queries=2,
@@ -304,7 +305,26 @@ class DexVLG(nn.Module):
             depth=flow_depth,
             num_heads=flow_heads,
             cond_dim=bert_dim,
+            hand_interaction=hand_interaction,
         )
+
+        cfg_settings = cfg.get("cfg", {}) or {}
+        self.cfg_drop_prob = float(cfg_settings.get("drop_prob", 0.0))
+        self.cfg_guidance_scale = float(cfg_settings.get("guidance_scale", 1.0))
+        if self.cfg_drop_prob > 0.0:
+            self.null_cond = nn.Parameter(torch.randn(1, 1, bert_dim) * 0.02)
+        else:
+            self.null_cond = None
+
+        aff_cfg = cfg.get("affordance", {}) or {}
+        self.use_affordance = bool(aff_cfg.get("enabled", False))
+        if self.use_affordance:
+            aff_hidden = int(aff_cfg.get("hidden_dim", 192))
+            self.affordance_head = nn.Sequential(
+                nn.Linear(bert_dim, aff_hidden),
+                nn.GELU(),
+                nn.Linear(aff_hidden, 1),
+            )
 
     def encode_language(
         self, texts: list[str], device: torch.device
@@ -346,7 +366,17 @@ class DexVLG(nn.Module):
 
         lang_features, lang_mask = self.encode_language(texts, xyz.device)
 
-        return self.fusion(pc_tokens, lang_features, lang_mask)
+        fused = self.fusion(pc_tokens, lang_features, lang_mask)
+
+        if self.use_affordance:
+            num_pc = pc_tokens.shape[1]
+            pc_fused = fused[:, :num_pc]
+            scores = self.affordance_head(pc_fused).squeeze(-1)
+            weights = torch.softmax(scores, dim=-1)
+            summary = torch.einsum("bn,bnd->bd", weights, pc_fused)
+            fused = torch.cat([fused, summary.unsqueeze(1)], dim=1)
+
+        return fused
 
     def compute_loss(
         self,
@@ -374,6 +404,12 @@ class DexVLG(nn.Module):
         device = xyz.device
 
         cond_tokens = self.encode_condition(xyz, rgb, texts)
+
+        if self.training and self.null_cond is not None and self.cfg_drop_prob > 0:
+            drop_mask = torch.rand(B, device=device) < self.cfg_drop_prob
+            if drop_mask.any():
+                null = self.null_cond.expand(B, cond_tokens.shape[1], -1)
+                cond_tokens = torch.where(drop_mask[:, None, None], null, cond_tokens)
 
         t = torch.rand(B, device=device)
         noise = torch.randn_like(gt_poses)
@@ -416,6 +452,10 @@ class DexVLG(nn.Module):
 
         cond_tokens = self.encode_condition(xyz, rgb, texts)
 
+        use_cfg = self.null_cond is not None and self.cfg_guidance_scale != 1.0
+        if use_cfg:
+            null_tokens = self.null_cond.expand(B, cond_tokens.shape[1], -1)
+
         x = torch.randn(B, 2, self.pose_dim, device=device)
         dt = 1.0 / num_steps
 
@@ -423,6 +463,9 @@ class DexVLG(nn.Module):
             t_val = step / num_steps
             t = torch.full((B,), t_val, device=device)
             v = self.flow_transformer(x, t, cond_tokens)
+            if use_cfg:
+                v_uncond = self.flow_transformer(x, t, null_tokens)
+                v = v_uncond + self.cfg_guidance_scale * (v - v_uncond)
             x = x + v * dt
 
         results = {}

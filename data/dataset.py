@@ -62,6 +62,12 @@ HAND_SIDES = ("left", "right")
 SINGLE_HAND_RAW_POSE_DIM = 28  # [trans(3), axis_angle(3), joints(22)]
 
 
+def group_id_of(record: dict) -> str:
+    """Stable (obj_id, pose_id, guidance) group id; tolerates the guidence spelling."""
+    guidance = record.get("guidance", record.get("guidence", ""))
+    return f"{record.get('obj_id', '')}|{record.get('pose_id', 0)}|{guidance}"
+
+
 def sample_point_cloud_from_mesh(
     mesh_path: str,
     n_points: int = 4096,
@@ -349,6 +355,7 @@ class DexGraspDataset(Dataset):
             "pose_right": pose_right,
             "obj_id": str(record.get("obj_id", "")),
             "cate_id": str(record.get("cate_id", "")),
+            "group_id": group_id_of(record),
         }
 
 
@@ -363,6 +370,7 @@ def collate_fn(batch: list[dict]) -> dict:
     result["gt_poses"] = torch.stack([pose_left, pose_right], dim=1)
     result["obj_ids"] = [b["obj_id"] for b in batch]
     result["cate_ids"] = [b["cate_id"] for b in batch]
+    result["group_ids"] = [b["group_id"] for b in batch]
     return result
 
 

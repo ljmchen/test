@@ -159,10 +159,16 @@ def _load_bert(bert_name: str, bert_dim: int):
         logger.info("Loaded pretrained BERT from '%s'", pretrained_path)
         return tokenizer, bert
     except Exception as e:
+        # A configured local path that fails to load is a misconfiguration —
+        # fail loudly instead of silently training on random weights. Only fall
+        # back when the name is a (non-local) HF id that can't be fetched offline.
+        if local_only:
+            raise RuntimeError(
+                f"Failed to load BERT from configured local path '{pretrained_path}': {e}"
+            ) from e
         logger.warning(
-            "Could not load pretrained '%s' (%s), using random init",
-            pretrained_path,
-            e,
+            "Could not load '%s' (%s); it is not a local path, using random init",
+            pretrained_path, e,
         )
         return _random_bert(bert_dim)
 
@@ -190,14 +196,29 @@ def _load_modernbert(model_name: str, hidden_dim: int):
         logger.info("Loaded ModernBERT from '%s' (hidden_size=%d)", pretrained_path, got)
         return tokenizer, model
     except Exception as e:
+        if local_only:
+            raise RuntimeError(
+                f"Failed to load ModernBERT from configured local path '{pretrained_path}': {e}"
+            ) from e
         logger.warning(
-            "Could not load ModernBERT '%s' (%s), using random BERT", pretrained_path, e
+            "Could not load ModernBERT '%s' (%s); it is not a local path, using random BERT",
+            pretrained_path, e,
         )
         return _random_bert(hidden_dim)
 
 
 def _load_language_model(backbone: str, model_name: str, hidden_dim: int):
     """Dispatch to the configured language backbone (BERT default, or ModernBERT)."""
+    # A name that is clearly meant as a local path (e.g. a typo'd pretrained dir)
+    # must not be silently treated as an HF id and fall back to random weights.
+    looks_local = str(model_name).startswith(("pretrained_models", "models/", "./", "../", "/", "~"))
+    if looks_local:
+        _, local_only = _resolve_pretrained_path(model_name)
+        if not local_only:
+            raise FileNotFoundError(
+                f"Configured local language-model path '{model_name}' does not exist. "
+                "Fix model.bert_model or download the weights; refusing to fall back to random."
+            )
     backbone = (backbone or "bert").lower().replace("-", "").replace("_", "")
     if backbone in ("modernbert", "modern"):
         return _load_modernbert(model_name, hidden_dim)
@@ -236,6 +257,20 @@ class DexVLG(nn.Module):
         self.rot_dim = 6
         self.joint_dim = joint_dim
         self.pose_dim = self.trans_dim + self.rot_dim + joint_dim
+
+        # Per-element flow-loss weights. Joints occupy 22/31 dims and otherwise
+        # dominate the plain MSE, leaving translation (3) / rotation (6)
+        # under-trained. Up-weight them via model.flow_loss_component_weights
+        # (all 1.0 -> identical to the old unweighted MSE).
+        fw = cfg.get("flow_loss_component_weights", {}) or {}
+        flow_weight = torch.cat(
+            [
+                torch.full((self.trans_dim,), float(fw.get("translation", 1.0))),
+                torch.full((self.rot_dim,), float(fw.get("rotation", 1.0))),
+                torch.full((joint_dim,), float(fw.get("joint", 1.0))),
+            ]
+        ).view(1, 1, self.pose_dim)
+        self.register_buffer("flow_loss_weight", flow_weight, persistent=False)
 
         self.pc_encoder = PointNet2Encoder(
             in_channels=cfg.get("pc_in_channels", 6),
@@ -349,7 +384,9 @@ class DexVLG(nn.Module):
 
         pred_v = self.flow_transformer(x_t, t, cond_tokens)
 
-        loss_fm = nn.functional.mse_loss(pred_v, target_v)
+        # per-element weighted MSE (flow_loss_weight is all-ones by default,
+        # reducing to the plain MSE; up-weight translation/rotation via config).
+        loss_fm = (self.flow_loss_weight * (pred_v - target_v) ** 2).mean()
 
         return {"loss": loss_fm, "loss_flow_matching": loss_fm}
 

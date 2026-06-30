@@ -30,6 +30,13 @@ model:
   # Grasp pose dimensions (Shadow Hand)
   joint_dim: 22               # 22 DOF for Shadow Hand
 
+  # Per-element flow-loss weights. Joints (22 dims) otherwise dominate the MSE;
+  # up-weight translation/rotation. All 1.0 == old unweighted MSE.
+  flow_loss_component_weights:
+    translation: 3.0
+    rotation: 6.0
+    joint: 1.0
+
 # ─── Data ─────────────────────────────────────────────────────────────
 # LGBiDex bimanual format (mirrors dexvlm's LgbiDexDataset input processing).
 data:
@@ -37,10 +44,14 @@ data:
   # val_data: "/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/test_v3.json"
   # test_data: "/home/jiaxuan/wowowowo/slai/Dataset/lgbidex/test_v3.json"
   # mesh_root: "/home/jiaxuan/wowowowo/slai/Dataset/MeshProcess/assets/object/oakink_obj/processed_data"
-  train_data: "/mnt/afs/L202500241/asserts/lgbidex/pose_data/train_v3_sim3.json"
-  val_data: "/mnt/afs/L202500241/asserts/lgbidex/pose_data/test_v3_sim3.json"
-  test_data: "/mnt/afs/L202500241/asserts/lgbidex/pose_data/test_v3_sim3.json"
+  train_data: "/mnt/afs/L202500241/asserts/lgbidex/pose_data/train_v4.json"
+  val_data: "/mnt/afs/L202500241/asserts/lgbidex/pose_data/test_v4.json"
+  test_data: "/mnt/afs/L202500241/asserts/lgbidex/pose_data/test_v4.json"
   mesh_root: "/mnt/afs/L202500241/asserts/lgbidex/oakink_obj/processed_data"
+  # train_data: "/mnt/afs/L202500241/asserts/lgbidex/pose_data/train_v3_sim3.json"
+  # val_data: "/mnt/afs/L202500241/asserts/lgbidex/pose_data/test_v3_sim3.json"
+  # test_data: "/mnt/afs/L202500241/asserts/lgbidex/pose_data/test_v3_sim3.json"
+  # mesh_root: "/mnt/afs/L202500241/asserts/lgbidex/oakink_obj/processed_data"
   n_points: 4096                    # Must match the PLY tag simplified_part_{N}.ply
   augment: false                    # Rotation aug breaks PC/grasp correspondence; keep off
   # Point cloud sourcing (see data/dataset.py)
@@ -50,16 +61,19 @@ data:
   # Object-centered coordinate convention (matches dexvlm)
   center_on_object: true
   obj_pose_quaternion_order: wxyz
-  # Per-hand min-max[-1,1] pose normalization (translation+joints); matches dexvlm.
-  # Targets are normalized for training; validation/inference denormalize back.
+  # Per-hand pose normalization (translation+joints); rotation 6D passes through.
+  # mode: minmax11 -> map [min,max] to [-1,1] using fixed factor tables (ROM bounds).
+  #       meastd11  -> standardize by (x-mean)/(2*std) using data-measured factors;
+  #                    needs stats_path (run tools/compute_norm_stats.py to make it).
   normalization:
     enabled: true
     mode: minmax11
+    stats_path: tools/meastd_factors.json   # required when mode: meastd11
 
 # ─── Training ─────────────────────────────────────────────────────────
 training:
-  epochs: 60
-  batch_size: 128
+  epochs: 200
+  batch_size: 128 #128
   lr: 1.0e-4
   weight_decay: 1.0e-4
   warmup_steps: 1000
@@ -67,10 +81,15 @@ training:
 
   optimizer: "adamw"
   scheduler: "cosine"
-  num_workers: 8
+  num_workers: 16
   persistent_workers: true    # keep workers + warm point-cloud cache across epochs
-  prefetch_factor: 2          # batches prefetched per worker (overlaps I/O with GPU)
+  prefetch_factor: 4          # batches prefetched per worker (overlaps I/O with GPU)
   seed: 42
+  # AMP precision: bf16 | fp16 | fp32. bf16 RECOMMENDED on H100 / with ModernBERT
+  # (fp16 can overflow -> inf -> poisons BatchNorm stats -> permanent NaN). bf16
+  # disables the grad scaler (not needed). `fp16: true/false` kept as a fallback
+  # only when `precision` is unset.
+  precision: bf16
   fp16: true
   log_interval: 1000           # train loss written to console + train.log every N steps
   val_interval: 1             # sampling-based validation every N epochs (not steps)
@@ -82,6 +101,23 @@ training:
     translation: true
     rotation: true
     joint: true
+
+  # Group-internal best match. false -> each prediction scored vs its own record's
+  # GT (one-to-one). true -> scored vs the CLOSEST GT among ALL grasps in its
+  # (obj_id, pose_id, guidance) group, so valid-but-different grasps aren't
+  # penalized (the metric then tracks success far better). Independent of
+  # epoch_sampling; candidates always come from the full val set.
+  val_group_min: true
+
+  # Per-epoch grouped resampling. enabled=false -> use every record each epoch
+  # (original behavior). enabled=true -> each epoch draw `samples_per_group`
+  # grasps from every (group_keys) combo; val uses a fixed `val_samples_per_group`
+  # subset. 'guidance' also matches the 'guidence' spelling.
+  epoch_sampling:
+    enabled: false
+    group_keys: [obj_id, pose_id, guidance]
+    samples_per_group: 1
+    val_samples_per_group: 1
 
 # ─── Inference ────────────────────────────────────────────────────────
 inference:

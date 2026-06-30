@@ -22,8 +22,9 @@ from torch.utils.tensorboard import SummaryWriter
 import yaml
 from tqdm import tqdm
 
-from data.dataset import create_dataloader, DexGraspDataset, collate_fn
+from data.dataset import create_dataloader, DexGraspDataset, collate_fn, group_id_of
 from data.pose_normalizer import build_hand_normalizers
+from data.samplers import GroupedEpochSampler
 from models.dexvlg import DexVLG
 from utils.rotation import rotation_6d_to_matrix
 from utils.misc import set_seed, count_parameters, AverageMeter
@@ -51,6 +52,26 @@ def parse_args() -> argparse.Namespace:
 def load_config(path: str) -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
+
+
+def get_amp_settings(train_cfg: dict) -> tuple[bool, torch.dtype, bool]:
+    """Resolve AMP from config -> (autocast_enabled, dtype, use_grad_scaler).
+
+    ``precision: fp16 | bf16 | fp32`` (preferred); falls back to the legacy
+    ``fp16`` bool. **bf16 is recommended on H100 / with ModernBERT**: fp16 can
+    overflow these activations to inf, which poisons BatchNorm running stats and
+    yields permanent NaNs (GradScaler only gates the optimizer step, not the
+    forward-updated buffers). The grad scaler is only used for fp16.
+    """
+    precision = train_cfg.get("precision")
+    if precision is None:
+        precision = "fp16" if train_cfg.get("fp16", True) else "fp32"
+    precision = str(precision).lower()
+    if precision in ("bf16", "bfloat16"):
+        return True, torch.bfloat16, False
+    if precision in ("fp16", "float16", "half"):
+        return True, torch.float16, True
+    return False, torch.float32, False
 
 
 def setup_logging(log_dir: str, rank: int) -> logging.Logger:
@@ -132,9 +153,10 @@ def train_one_epoch(
 
     model.train()
     loss_meter = AverageMeter()
-    use_fp16 = cfg["training"].get("fp16", True)
+    amp_enabled, amp_dtype, _ = get_amp_settings(cfg["training"])
     grad_clip = cfg["training"].get("grad_clip", 1.0)
     log_interval = cfg["training"].get("log_interval", 50)
+    nonfinite_skips = 0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=rank != 0)
     for batch in pbar:
@@ -145,9 +167,22 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast("cuda", enabled=use_fp16):
+        with autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
             outputs = model(xyz, rgb, texts, gt_poses=gt_poses)
             loss = outputs["loss"]
+
+        # Skip the step on a non-finite loss instead of stepping into NaN weights.
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+            global_step += 1
+            nonfinite_skips += 1
+            if rank == 0 and nonfinite_skips <= 5:
+                logger.warning(
+                    f"[epoch {epoch} step {global_step}] non-finite loss; step skipped "
+                    f"(total skipped this epoch: {nonfinite_skips})"
+                )
+            continue
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -181,9 +216,22 @@ def run_validation(vc: dict, epoch: int, global_step: int) -> None:
     Collective: every rank must call this together. Only rank 0 logs/saves.
     """
     model = vc["model"]
+    # Build (once, cached) the group->GT-candidates map for group-internal matching.
+    group_candidates = None
+    if bool(vc["cfg"]["training"].get("val_group_min", False)) and vc["val_loader"] is not None:
+        if vc.get("group_candidates") is None:
+            vc["group_candidates"] = build_group_candidates(
+                vc["val_loader"].dataset, vc.get("normalizers"), torch.device("cuda")
+            )
+            if vc["rank"] == 0:
+                vc["logger"].info(
+                    f"Built val group candidates: {len(vc['group_candidates'])} groups "
+                    "(group-internal best-match validation ON)"
+                )
+        group_candidates = vc["group_candidates"]
     val_metrics = validate(
         model, vc["val_loader"], vc["cfg"], vc["rank"], vc["distributed"],
-        normalizers=vc.get("normalizers"),
+        normalizers=vc.get("normalizers"), group_candidates=group_candidates,
     )
     model.train()  # restore training mode on every rank before continuing
 
@@ -215,6 +263,54 @@ def run_validation(vc: dict, epoch: int, global_step: int) -> None:
     logger.info(msg)
 
 
+def pose_component_errors(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    trans_dim: int,
+    rot_dim: int,
+    mse_trans: bool,
+    mse_rot: bool,
+    mse_joint: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-element translation/rotation/joint errors between ``pred`` and ``target``.
+
+    Broadcasts: shapes ``(..., 31)`` -> three ``(...,)`` tensors. Used both for
+    one-to-one (B vs B) and group matching (one pred vs K candidates).
+    """
+    p_t, p_r, p_j = pred[..., :trans_dim], pred[..., trans_dim:trans_dim + rot_dim], pred[..., trans_dim + rot_dim:]
+    g_t, g_r, g_j = target[..., :trans_dim], target[..., trans_dim:trans_dim + rot_dim], target[..., trans_dim + rot_dim:]
+    trans = ((p_t - g_t) ** 2).mean(-1) if mse_trans else torch.norm(p_t - g_t, dim=-1)
+    rot = ((p_r - g_r) ** 2).mean(-1) if mse_rot else geodesic_angle(p_r, g_r)
+    joint = ((p_j - g_j) ** 2).mean(-1) if mse_joint else torch.abs(p_j - g_j).mean(-1)
+    return trans, rot, joint
+
+
+@torch.no_grad()
+def build_group_candidates(dataset, normalizers: dict | None, device) -> dict:
+    """Collect all GT bimanual grasps of each (obj_id,pose_id,guidance) group.
+
+    Returns ``{group_id: {"left": (K,31), "right": (K,31)}}`` in real
+    (denormalized) units on ``device``, for group-internal best-match validation.
+    """
+    from collections import defaultdict
+
+    left: dict[str, list] = defaultdict(list)
+    right: dict[str, list] = defaultdict(list)
+    for record in dataset.data:
+        gid = group_id_of(record)
+        left[gid].append(dataset._build_hand_pose(record, "left"))
+        right[gid].append(dataset._build_hand_pose(record, "right"))
+    out: dict[str, dict] = {}
+    for gid in left:
+        cand_left = torch.stack(left[gid]).float()
+        cand_right = torch.stack(right[gid]).float()
+        if normalizers is not None:
+            cand_left = normalizers["left"].denormalize_pose(cand_left)
+            cand_right = normalizers["right"].denormalize_pose(cand_right)
+        out[gid] = {"left": cand_left.to(device), "right": cand_right.to(device)}
+    return out
+
+
 @torch.no_grad()
 def validate(
     model: torch.nn.Module,
@@ -223,6 +319,7 @@ def validate(
     rank: int,
     distributed: bool = False,
     normalizers: dict | None = None,
+    group_candidates: dict | None = None,
 ) -> dict[str, float]:
     """Validate by running the full N-step ODE sampling, then scoring poses.
 
@@ -244,7 +341,7 @@ def validate(
     """
     model.eval()
     net = model.module if hasattr(model, "module") else model
-    use_fp16 = cfg["training"].get("fp16", True)
+    amp_enabled, amp_dtype, _ = get_amp_settings(cfg["training"])
     num_steps = cfg.get("inference", {}).get("num_steps", 10)
     # optional cap on validation batches (0 = whole val set) for cheap, frequent eval
     max_batches = int(cfg["training"].get("val_max_batches", 0))
@@ -271,12 +368,13 @@ def validate(
         texts = batch["texts"]
         bsz = xyz.shape[0]
 
-        with autocast("cuda", enabled=use_fp16):
+        with autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
             pred = net.sample(xyz, rgb, texts, num_steps=num_steps)
 
-        for i, hand in enumerate(["left", "right"]):
-            gt = gt_poses[:, i].float()
-            pred_pose = torch.cat(
+        # denormalized predictions per hand -> real units (B, 31)
+        pred_real = {}
+        for hand in ("left", "right"):
+            pp = torch.cat(
                 [
                     pred[f"{hand}_translation"].float(),
                     pred[f"{hand}_rotation_6d"].float(),
@@ -284,35 +382,42 @@ def validate(
                 ],
                 dim=-1,
             )
-            # back to real units (meters / radians) so the reported errors and
-            # the checkpoint-selection score are interpretable.
             if normalizers is not None:
-                gt = normalizers[hand].denormalize_pose(gt)
-                pred_pose = normalizers[hand].denormalize_pose(pred_pose)
+                pp = normalizers[hand].denormalize_pose(pp)
+            pred_real[hand] = pp
 
-            gt_trans = gt[:, :trans_dim]
-            gt_rot6d = gt[:, trans_dim : trans_dim + rot_dim]
-            gt_joints = gt[:, trans_dim + rot_dim :]
-            pred_trans = pred_pose[:, :trans_dim]
-            pred_rot6d = pred_pose[:, trans_dim : trans_dim + rot_dim]
-            pred_joints = pred_pose[:, trans_dim + rot_dim :]
-
-            # translation: MSE (mean squared) or L2 Euclidean distance
-            if mse_trans:
-                sums[0] += ((pred_trans - gt_trans) ** 2).mean(dim=-1).sum()
-            else:
-                sums[0] += torch.norm(pred_trans - gt_trans, dim=-1).sum()
-            # rotation: MSE on the 6D representation, or geodesic angle (radians)
-            if mse_rot:
-                sums[1] += ((pred_rot6d - gt_rot6d) ** 2).mean(dim=-1).sum()
-            else:
-                sums[1] += geodesic_angle(pred_rot6d, gt_rot6d).sum()
-            # joint: MSE (mean squared) or L1 mean absolute error (radians)
-            if mse_joint:
-                sums[2] += ((pred_joints - gt_joints) ** 2).mean(dim=-1).sum()
-            else:
-                sums[2] += torch.abs(pred_joints - gt_joints).mean(dim=-1).sum()
-            count += bsz
+        if group_candidates is not None:
+            # group-internal best match: each prediction is scored against the
+            # closest GT among ALL grasps in its (obj_id,pose_id,guidance) group.
+            group_ids = batch["group_ids"]
+            for b in range(bsz):
+                cand = group_candidates.get(group_ids[b])
+                if cand is None:
+                    continue
+                tl, rl, jl = pose_component_errors(
+                    pred_real["left"][b], cand["left"], trans_dim, rot_dim, mse_trans, mse_rot, mse_joint
+                )
+                tr, rr, jr = pose_component_errors(
+                    pred_real["right"][b], cand["right"], trans_dim, rot_dim, mse_trans, mse_rot, mse_joint
+                )
+                k = torch.argmin((tl + rl + jl) + (tr + rr + jr))  # best bimanual candidate
+                sums[0] += tl[k] + tr[k]
+                sums[1] += rl[k] + rr[k]
+                sums[2] += jl[k] + jr[k]
+                count += 2  # two hands
+        else:
+            # one-to-one: each prediction is scored against its own record's GT.
+            for i, hand in enumerate(("left", "right")):
+                gt = gt_poses[:, i].float()
+                if normalizers is not None:
+                    gt = normalizers[hand].denormalize_pose(gt)
+                trans, rot, joint = pose_component_errors(
+                    pred_real[hand], gt, trans_dim, rot_dim, mse_trans, mse_rot, mse_joint
+                )
+                sums[0] += trans.sum()
+                sums[1] += rot.sum()
+                sums[2] += joint.sum()
+                count += bsz
 
     if distributed:
         dist.all_reduce(sums, op=dist.ReduceOp.SUM)
@@ -468,7 +573,28 @@ def main():
         loader_kwargs["persistent_workers"] = train_cfg.get("persistent_workers", True)
         loader_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 4)
 
-    train_sampler = DistributedSampler(train_dataset) if distributed else None
+    # Optional per-epoch grouped resampling: each epoch draw N grasps per
+    # (obj_id, pose_id, guidance) combo instead of using every record. Keeps the
+    # original full-dataset path when disabled.
+    world_size = dist.get_world_size() if distributed else 1
+    es_cfg = dict(train_cfg.get("epoch_sampling", {}) or {})
+    use_epoch_sampling = bool(es_cfg.get("enabled", False))
+    group_keys = es_cfg.get("group_keys", ["obj_id", "pose_id", "guidance"])
+    seed = train_cfg.get("seed", 42)
+    if rank == 0 and use_epoch_sampling:
+        logger.info(
+            f"Epoch sampling ON: {es_cfg.get('samples_per_group', 4)} per "
+            f"{'+'.join(group_keys)} combo (train), "
+            f"{es_cfg.get('val_samples_per_group', es_cfg.get('samples_per_group', 4))} (val)."
+        )
+
+    if use_epoch_sampling:
+        train_sampler = GroupedEpochSampler(
+            train_dataset.data, group_keys, int(es_cfg.get("samples_per_group", 4)),
+            shuffle=True, num_replicas=world_size, rank=rank, base_seed=seed, drop_last=True,
+        )
+    else:
+        train_sampler = DistributedSampler(train_dataset) if distributed else None
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=train_cfg["batch_size"],
@@ -491,7 +617,15 @@ def main():
             augment=False,
             **dataset_kwargs,
         )
-        val_sampler = DistributedSampler(val_dataset, shuffle=False) if distributed else None
+        if use_epoch_sampling:
+            # Fixed (epoch 0) grouped subset for a stable, comparable val metric.
+            val_per_group = int(es_cfg.get("val_samples_per_group", es_cfg.get("samples_per_group", 4)))
+            val_sampler = GroupedEpochSampler(
+                val_dataset.data, group_keys, val_per_group, shuffle=False,
+                num_replicas=world_size, rank=rank, base_seed=seed, drop_last=False,
+            )
+        else:
+            val_sampler = DistributedSampler(val_dataset, shuffle=False) if distributed else None
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=train_cfg["batch_size"],
@@ -516,7 +650,8 @@ def main():
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, train_cfg.get("warmup_steps", 1000), total_steps,
     )
-    scaler = GradScaler("cuda", enabled=train_cfg.get("fp16", True))
+    _, _, use_scaler = get_amp_settings(train_cfg)
+    scaler = GradScaler("cuda", enabled=use_scaler)
 
     start_epoch = 0
     global_step = 0
@@ -563,8 +698,13 @@ def main():
     }
 
     if rank == 0:
+        _amp_en, _amp_dt, _amp_sc = get_amp_settings(train_cfg)
+        _prec = str(_amp_dt).replace("torch.", "") if _amp_en else "fp32"
         logger.info(f"Training for {train_cfg['epochs']} epochs, {total_steps} steps")
-        logger.info(f"Batch size: {train_cfg['batch_size']}, LR: {train_cfg['lr']}")
+        logger.info(
+            f"Batch size: {train_cfg['batch_size']}, LR: {train_cfg['lr']}, "
+            f"precision: {_prec} (grad_scaler={_amp_sc})"
+        )
         logger.info(
             f"Validation: every {val_interval} epoch(s) via "
             f"{cfg.get('inference', {}).get('num_steps', 10)}-step sampling"
@@ -576,7 +716,9 @@ def main():
     last_epoch = train_cfg["epochs"] - 1
     validated_last_epoch = False
     for epoch in range(start_epoch, train_cfg["epochs"]):
-        if distributed:
+        # Re-seed the per-epoch sampler so each epoch draws a fresh subset
+        # (DistributedSampler also needs this for correct cross-epoch shuffling).
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
 
         train_loss, global_step = train_one_epoch(vc, train_loader, epoch, global_step)

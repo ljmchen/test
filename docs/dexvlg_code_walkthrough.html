@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DexVLG 逐代码精讲 · 小白完全理解版</title>
+<style>
+  :root{
+    --bg:#0e1117; --panel:#161b22; --ink:#e6edf3; --muted:#9aa7b4;
+    --line:#2a3340; --accent:#6ea8fe; --accent2:#7ee787; --code-bg:#0b0f14;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",Helvetica,Arial,sans-serif;
+    line-height:1.7;font-size:16px;}
+  a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+  .wrap{display:flex;max-width:1560px;margin:0 auto}
+  nav{position:sticky;top:0;align-self:flex-start;height:100vh;overflow-y:auto;
+    width:300px;min-width:300px;padding:24px 16px;border-right:1px solid var(--line);
+    background:linear-gradient(180deg,#11151c,#0e1117)}
+  nav h2{font-size:15px;color:var(--accent);margin:0 0 4px}
+  nav .sub{font-size:12px;color:var(--muted);margin-bottom:16px}
+  nav a.grp{display:block;font-size:11px;letter-spacing:.6px;color:#6f7e8c;margin:14px 0 4px;text-transform:uppercase}
+  nav ul{list-style:none;padding:0;margin:0}
+  nav ul li a{display:block;padding:6px 10px;border-radius:7px;color:var(--muted);font-size:13.5px}
+  nav ul li a:hover{background:#1b2330;color:var(--ink);text-decoration:none}
+  nav ul li a code{font-size:12px;background:none;border:none;color:inherit;padding:0}
+  main{flex:1;min-width:0;padding:40px 52px 120px;max-width:1060px}
+  header.hero{padding:32px 36px;border-radius:18px;margin-bottom:36px;
+    background:radial-gradient(1000px 360px at 0% 0%,rgba(110,168,254,.15),transparent),
+               linear-gradient(180deg,#141a23,#10151c);border:1px solid var(--line)}
+  header.hero .tag{display:inline-block;font-size:12.5px;color:#0e1117;background:var(--accent);
+    padding:3px 10px;border-radius:999px;font-weight:700;margin-bottom:12px}
+  header.hero h1{margin:.1em 0;font-size:31px}
+  header.hero p{color:var(--muted)}
+  section{margin:0 0 30px;scroll-margin-top:16px}
+  .filehead{display:flex;align-items:center;gap:12px;margin:42px 0 4px;padding:14px 18px;border-radius:12px;
+    background:linear-gradient(90deg,#16202c,#121821);border:1px solid var(--line);scroll-margin-top:16px}
+  .filehead .fi{font-size:20px}
+  .filehead h2{margin:0;font-size:21px;font-family:"JetBrains Mono",Consolas,monospace;color:#dbe7ff}
+  .filehead .role{margin-left:auto;font-size:12px;color:var(--muted);text-align:right;max-width:46%}
+  h3{font-size:18px;margin:26px 0 6px;color:#bcd3ff;border-left:3px solid var(--accent);padding-left:10px}
+  h4{font-size:15.5px;margin:16px 0 4px;color:var(--accent2)}
+  p{margin:.55em 0}
+  ul,ol{padding-left:22px}li{margin:4px 0}
+  code{font-family:"JetBrains Mono",Consolas,"SF Mono",Menlo,monospace;font-size:13.3px;
+    background:#1b2330;padding:1.5px 6px;border-radius:5px;color:#ffd9a8;border:1px solid #28303d}
+  pre{background:var(--code-bg);border:1px solid var(--line);border-radius:12px;padding:0;overflow:hidden;margin:14px 0}
+  pre .codebar{display:flex;align-items:center;gap:7px;padding:8px 14px;border-bottom:1px solid var(--line);
+    background:#11161d;font-size:12px;color:var(--muted)}
+  pre .codebar .dot{width:10px;height:10px;border-radius:50%}
+  pre .codebar .fn{margin-left:8px;font-family:monospace;color:#9fb4c7}
+  pre code{display:block;background:none;border:none;padding:15px 18px;color:#cdd6e0;font-size:13.1px;
+    line-height:1.62;overflow-x:auto;white-space:pre}
+  .c{color:#6a7d8c;font-style:italic}.s{color:#8ee398}.kw{color:#ff9ec3}.bi{color:#7cc7ff}
+  .num{color:#ffcb6b}.dec{color:#f78c6b}.fn{color:#82d4ff}
+  .box{border-radius:12px;padding:13px 17px;margin:14px 0;border:1px solid var(--line)}
+  .box .t{font-weight:800;font-size:13.5px;margin-bottom:3px;display:flex;gap:7px;align-items:center}
+  .box.tip{background:linear-gradient(180deg,rgba(126,231,135,.08),transparent);border-color:#2e5e3a}.box.tip .t{color:var(--accent2)}
+  .box.key{background:linear-gradient(180deg,rgba(110,168,254,.09),transparent);border-color:#2f4d7a}.box.key .t{color:var(--accent)}
+  .box.warn{background:linear-gradient(180deg,rgba(255,209,102,.09),transparent);border-color:#6b5a25}.box.warn .t{color:#ffd166}
+  .box.ana{background:linear-gradient(180deg,rgba(199,146,234,.09),transparent);border-color:#5a3f73}.box.ana .t{color:#c792ea}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13.6px;border-radius:10px;overflow:hidden}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:#1b2330;color:#cdd9e5}tr:nth-child(even) td{background:#12171e}
+  .ann{margin:10px 0;border-left:2px dashed #3a4a5c;padding-left:14px}
+  .ann .ln{font-family:monospace;font-size:12.5px;color:#ffd9a8;background:#1b2330;border:1px solid #28303d;
+    padding:1px 7px;border-radius:5px;margin-right:6px}
+  .small{font-size:12.8px;color:var(--muted)}
+  .pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;font-weight:700}
+  .pill.in{background:#1f2b3a;color:#9fd0ff}.pill.out{background:#1f3326;color:#a6f0b4}
+  .shape{font-family:monospace;font-size:12px;color:#0b0f14;background:#cdd9e5;border-radius:5px;padding:1px 7px;font-weight:700}
+  .footer{margin-top:56px;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+  hr.soft{border:none;border-top:1px dashed var(--line);margin:22px 0}
+  @media(max-width:980px){nav{display:none}main{padding:22px 16px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <h2>DexVLG 逐代码精讲</h2>
+  <div class="sub">小白友好 · 逐文件逐函数</div>
+  <a class="grp">阅读指南</a>
+  <ul><li><a href="#map">代码地图 & 阅读顺序</a></li></ul>
+  <a class="grp">地基：数学工具</a>
+  <ul><li><a href="#rotation"><code>utils/rotation.py</code></a></li></ul>
+  <a class="grp">五大模块</a>
+  <ul>
+    <li><a href="#pointnet2"><code>models/pointnet2.py</code></a></li>
+    <li><a href="#flow"><code>models/flow_matching.py</code></a></li>
+    <li><a href="#dexvlg"><code>models/dexvlg.py</code></a></li>
+    <li><a href="#decoder"><code>models/pose_decoder.py</code></a></li>
+  </ul>
+  <a class="grp">数据管线</a>
+  <ul>
+    <li><a href="#io"><code>data/lgbidex_io.py</code></a></li>
+    <li><a href="#dataset"><code>data/dataset.py</code></a></li>
+    <li><a href="#norm"><code>data/pose_normalizer.py</code></a></li>
+  </ul>
+  <a class="grp">训练 / 评估 / 推理</a>
+  <ul>
+    <li><a href="#train"><code>train.py</code></a></li>
+    <li><a href="#test"><code>test.py</code></a></li>
+    <li><a href="#infer"><code>inference.py</code></a></li>
+    <li><a href="#sanity"><code>test_sanity.py</code></a></li>
+  </ul>
+  <a class="grp">收尾</a>
+  <ul><li><a href="#connect">调用关系串讲</a></li></ul>
+</nav>
+
+<main>
+<header class="hero">
+  <span class="tag">逐代码精讲</span>
+  <h1>DexVLG 源码逐文件拆解</h1>
+  <p>这份文档配合《全模型架构精讲》食用：架构篇讲"<b>是什么、为什么</b>"，本篇讲"<b>代码具体怎么写、每行在干嘛</b>"。我们按"先地基、再模块、后管线、最后流程"的顺序，把每个文件最关键的函数挑出来逐行解释。代码块已做语法高亮，关键行用 <span class="ann" style="border:none;padding:0"><span class="ln">行号/片段</span></span> 标注。</p>
+</header>
+
+<!-- MAP -->
+<section id="map">
+<div class="filehead"><span class="fi">🗺️</span><h2>代码地图 & 阅读顺序</h2><div class="role">先建立全局认知，再钻细节</div></div>
+<table>
+  <tr><th>层次</th><th>文件</th><th>职责一句话</th></tr>
+  <tr><td rowspan="1">数学地基</td><td><code>utils/rotation.py</code></td><td>四元数 ↔ 旋转矩阵 ↔ 6D 互转</td></tr>
+  <tr><td rowspan="4">五大模块</td><td><code>models/pointnet2.py</code></td><td>① 点云编码：4096 点 → 64 个 token</td></tr>
+  <tr><td><code>models/flow_matching.py</code></td><td>⑤ 流匹配 Transformer：噪声→姿势的速度场</td></tr>
+  <tr><td><code>models/dexvlg.py</code></td><td>总装：把①②③④⑤拼起来，定义训练损失与采样</td></tr>
+  <tr><td><code>models/pose_decoder.py</code></td><td>辅助：把位姿向量拆成 T/R/θ（主流程其实直接切片）</td></tr>
+  <tr><td rowspan="3">数据管线</td><td><code>data/lgbidex_io.py</code></td><td>读 PLY/OBJ、坐标变换、轴角→6D 等纯函数</td></tr>
+  <tr><td><code>data/dataset.py</code></td><td>把磁盘上的记录变成 <code>(xyz,rgb,text,pose)</code></td></tr>
+  <tr><td><code>data/pose_normalizer.py</code></td><td>位姿 min-max 归一化 / 反归一化</td></tr>
+  <tr><td rowspan="4">流程脚本</td><td><code>train.py</code></td><td>训练循环、验证、best-K 检查点</td></tr>
+  <tr><td><code>test.py</code></td><td>跑测试集、算指标</td></tr>
+  <tr><td><code>inference.py</code></td><td>单物体推理 + 可视化</td></tr>
+  <tr><td><code>test_sanity.py</code></td><td>不需 GPU 的完整性自检</td></tr>
+</table>
+<div class="box tip"><div class="t">💡 建议阅读顺序</div>
+<b>rotation.py → pointnet2.py → flow_matching.py → dexvlg.py → dataset.py → train.py</b>。
+先吃透"旋转表示"和"两个网络模块"，再看"总装"如何把它们串起来，最后看数据怎么喂、训练怎么转。本篇正是这个顺序。</div>
+</section>
+
+<!-- ROTATION -->
+<section id="rotation">
+<div class="filehead"><span class="fi">📐</span><h2>utils/rotation.py</h2><div class="role">旋转表示的瑞士军刀<br>四元数 / 矩阵 / 6D 互转</div></div>
+<p>整个项目用 <b>6D 旋转</b>喂网络，但数据集里是<b>轴角</b>、可视化要<b>四元数</b>、算误差要<b>矩阵</b>。这个文件就是它们之间的"翻译官"。最核心的是 <code>rotation_6d_to_matrix</code>——把网络吐出的 6 个数变回一个合法旋转矩阵。</p>
+
+<pre><code class="py">def rotation_6d_to_matrix(d6: torch.Tensor) -&gt; torch.Tensor:
+    """Convert 6D rotation representation to rotation matrices via Gram-Schmidt."""
+    a1, a2 = d6[..., :3], d6[..., 3:6]          # 把 6 个数拆成两个 3 维向量
+    b1 = F.normalize(a1, dim=-1)                # 第一行：直接归一化成单位向量
+    b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1  # 第二行：减去在 b1 上的投影 → 与 b1 正交
+    b2 = F.normalize(b2, dim=-1)                # 再归一化
+    b3 = torch.cross(b1, b2, dim=-1)            # 第三行：前两行叉乘，自动正交且右手系
+    return torch.stack([b1, b2, b3], dim=-2)    # 堆成 (...,3,3) 旋转矩阵</code></pre>
+<div class="ann">
+  <p><span class="ln">a1,a2</span> 网络只需要给出"任意" 6 个数，不必保证正交。</p>
+  <p><span class="ln">b2 = a2 − (b1·a2)·b1</span> 这就是 <b>Gram–Schmidt 正交化</b>的精髓：把 a2 中"和 b1 平行的部分"扣掉，剩下的就垂直于 b1。</p>
+  <p><span class="ln">b3 = b1 × b2</span> 叉乘保证第三轴既垂直前两轴、又构成右手坐标系（合法旋转的行列式 = +1）。</p>
+</div>
+<div class="box key"><div class="t">🔑 为什么这是"连续"表示</div>
+不论网络输出什么 6 个数（只要 a1、a2 不平行），都能被"修"成一个合法旋转矩阵，且输出微小变化→旋转微小变化。这就避免了四元数的二义性和欧拉角的万向锁，回归任务里梯度更稳。</div>
+
+<h4>其它互转函数（同一套思路）</h4>
+<ul>
+  <li><code>quaternion_to_matrix</code>：按 <b>wxyz</b>（实部在前）约定把四元数展开成 3×3 矩阵；</li>
+  <li><code>matrix_to_rotation_6d</code>：取矩阵<b>前两行</b>拍平成 6 维（6D 的定义）；</li>
+  <li><code>matrix_to_quaternion</code>：用迹(trace)分支法反解四元数（数值稳定，带 <code>clamp</code> 防开根号负数）；</li>
+  <li><code>quaternion_to_rotation_6d</code> / <code>rotation_6d_to_quaternion</code>：组合上面几个，一步到位。</li>
+</ul>
+<div class="box tip"><div class="t">💡 约定要记牢</div>本项目四元数一律 <b>wxyz</b>（实部 w 在最前）。换库对接时这是最常见的踩坑点。</div>
+</section>
+
+<!-- POINTNET2 -->
+<section id="pointnet2">
+<div class="filehead"><span class="fi">🟦</span><h2>models/pointnet2.py</h2><div class="role">模块① 点云编码器<br>4096 点 → 64 个几何 token</div></div>
+<p>文件结构：几个<b>纯函数</b>（knn / FPS / 球查询 / 索引）+ 一个 <code>SetAbstraction</code> 层 + 把 3 个 SA 层串起来的 <code>PointNet2Encoder</code>。</p>
+
+<h3>四个基础函数</h3>
+<pre><code class="py">def farthest_point_sample(xyz, npoint):
+    """从 N 个点里挑 npoint 个'彼此最远'的点，返回它们的下标。"""
+    B, N, _ = xyz.shape
+    centroids = torch.zeros(B, npoint, dtype=torch.long, device=xyz.device)
+    distance = torch.full((B, N), 1e10, device=xyz.device)   # 每点到"已选集合"的最近距离
+    farthest = torch.randint(0, N, (B,), device=xyz.device)  # 随机选第一个点
+    for i in range(npoint):
+        centroids[:, i] = farthest                # 收录当前最远点
+        centroid = xyz[torch.arange(B), farthest].unsqueeze(1)
+        dist = torch.sum((xyz - centroid) ** 2, dim=-1)  # 所有点到它的距离
+        distance = torch.min(distance, dist)      # 更新"到已选集合的最近距离"
+        farthest = distance.argmax(dim=-1)        # 下一个最远点 = 当前最大最近距离者
+    return centroids</code></pre>
+<div class="box ana"><div class="t">🧩 FPS 在干嘛</div>贪心地一个个挑点，每次都挑"离已选点群最远"的那个。效果是选出的点<b>均匀铺满整个物体</b>，不会扎堆。这样下采样后仍能覆盖整体形状。</div>
+
+<pre><code class="py">def ball_query(xyz, new_xyz, radius, nsample):
+    """对每个中心点，找半径内的邻居；不足 nsample 个就用最近点补。"""
+    dist = torch.cdist(new_xyz, xyz)              # 中心点到所有点的距离矩阵
+    _, idx = dist.topk(nsample, largest=False)    # 先取最近的 nsample 个
+    mask = dist.gather(-1, idx) &gt; radius          # 标记其中超出半径的
+    first_idx = idx[:, :, 0:1].expand_as(idx)
+    idx[mask] = first_idx[mask]                   # 超界的用"最近邻"顶替（等价于丢弃）
+    return idx</code></pre>
+<div class="ann">
+  <p><span class="ln">topk(largest=False)</span> 这里用"取最近 nsample 个"近似真正的球查询，纯张量算子、无需 CUDA 扩展。</p>
+  <p><span class="ln">idx[mask]=first_idx</span> 半径外的邻居用第 0 个（最近）邻居替换，相当于"凑数但不引入远点噪声"。</p>
+</div>
+
+<p><code>knn</code>（基于 <code>torch.cdist</code> 找 k 近邻）和 <code>index_points</code>（按下标取点，处理好 batch 维广播）是两个小工具，服务于上面两个函数。</p>
+
+<h3>SetAbstraction：一个"采样-分组-聚合"层</h3>
+<pre><code class="py">class SetAbstraction(nn.Module):
+    def __init__(self, npoint, radius, nsample, in_channel, mlp_channels):
+        ...
+        last_channel = in_channel + 3            # +3：每个邻居要额外带"相对中心的 xyz"
+        for out_channel in mlp_channels:         # 一串 Conv1d+BN+ReLU
+            layers += [nn.Conv1d(last_channel, out_channel, 1),
+                       nn.BatchNorm1d(out_channel), nn.ReLU(inplace=True)]
+            last_channel = out_channel
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, xyz, features=None):
+        fps_idx = farthest_point_sample(xyz, self.npoint)   # ① 采样中心点
+        new_xyz = index_points(xyz, fps_idx)
+        group_idx = ball_query(xyz, new_xyz, self.radius, self.nsample)  # ② 分组
+        grouped_xyz = index_points(xyz, group_idx)
+        grouped_xyz -= new_xyz.unsqueeze(2)      # 关键：邻居坐标改成"相对中心"的局部坐标
+        if features is not None:
+            grouped_features = index_points(features, group_idx)
+            grouped_features = torch.cat([grouped_xyz, grouped_features], dim=-1)
+        else:
+            grouped_features = grouped_xyz
+        grouped_features = grouped_features.reshape(B*self.npoint, self.nsample, -1).permute(0,2,1)
+        grouped_features = self.mlp(grouped_features)        # ③ 共享 MLP 提特征
+        new_features = grouped_features.max(dim=-1).values   # ③ 组内最大池化 → 中心点新特征
+        return new_xyz, new_features.reshape(B, self.npoint, -1)</code></pre>
+<div class="ann">
+  <p><span class="ln">grouped_xyz -= new_xyz</span> 把邻居换成<b>相对中心</b>的局部坐标，这样学到的特征具有<b>平移不变性</b>（物体挪个位置，局部几何不变）。</p>
+  <p><span class="ln">in_channel + 3</span> 拼接顺序是 <code>[相对坐标(3), 上一层特征]</code>，所以 MLP 输入通道要 +3。</p>
+  <p><span class="ln">max(dim=-1)</span> 对组内 nsample 个邻居取逐通道最大值——这是 PointNet 系列的标志性操作，<b>对点的顺序不敏感</b>（置换不变）。</p>
+</div>
+
+<h3>PointNet2Encoder：三层堆叠</h3>
+<pre><code class="py">self.sa1 = SetAbstraction(512, 0.1, 32, self.feature_dim, [64, 64, 128])
+self.sa2 = SetAbstraction(128, 0.2, 64, 128,               [128, 128, 256])
+self.sa3 = SetAbstraction(num_output_tokens, 0.4, 64, 256, [256, 256, output_dim])
+
+def forward(self, xyz, features=None):
+    if self.feature_dim == 0:        # in_channels==3 → xyz-only，丢弃颜色
+        features = None
+    xyz1, feat1 = self.sa1(xyz, features)   # 4096 → 512
+    xyz2, feat2 = self.sa2(xyz1, feat1)     # 512  → 128
+    _,    feat3 = self.sa3(xyz2, feat2)     # 128  → 64（num_output_tokens）
+    return feat3                            # (B, 64, output_dim=256)</code></pre>
+<div class="box warn"><div class="t">⚠️ xyz-only 的自适应</div>
+<code>feature_dim = in_channels - 3</code>。当配置 <code>pc_in_channels=3</code> 时 <code>feature_dim==0</code>，forward 里把传进来的颜色直接置 <code>None</code>，避免首层 Conv 通道数对不上而崩溃。这就是为什么 <code>encode_condition</code> 可以"无脑"永远传 rgb。</div>
+</section>
+
+<!-- FLOW -->
+<section id="flow">
+<div class="filehead"><span class="fi">🟣</span><h2>models/flow_matching.py</h2><div class="role">模块⑤ 生成核心<br>DiT 风格速度场 v(x_t, t, c)</div></div>
+<p>三个零件：<code>sinusoidal_embedding</code>（时间编码）、<code>AdaLayerNorm</code>（注入时间）、<code>FlowMatchingBlock</code>（一层），再由 <code>FlowMatchingTransformer</code> 组装。</p>
+
+<h3>时间编码与 AdaLN</h3>
+<pre><code class="py">def sinusoidal_embedding(timesteps, dim):
+    """把标量时间 t 变成一段高低频正余弦向量（和 Transformer 位置编码同源）。"""
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=timesteps.device) / half)
+    args = timesteps.unsqueeze(-1) * freqs.unsqueeze(0)
+    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+class AdaLayerNorm(nn.Module):
+    def __init__(self, dim, cond_dim):
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False)  # 不带自带的缩放/平移
+        self.proj = nn.Linear(cond_dim, 2 * dim)                 # 用时间嵌入算出 scale 和 shift
+    def forward(self, x, cond):
+        scale, shift = self.proj(cond).unsqueeze(1).chunk(2, dim=-1)
+        return self.norm(x) * (1 + scale) + shift                # 用时间动态调制归一化</code></pre>
+<div class="box ana"><div class="t">🧩 为什么 (1 + scale)</div>初始化时 <code>proj</code> 输出≈0，于是 <code>(1+scale)=1, shift=0</code>，AdaLN 退化成普通归一化——这是个温和的"零初始化"技巧，让训练早期更稳，再慢慢学出时间相关的调制。</div>
+
+<h3>FlowMatchingBlock：自注意力 + 交叉注意力 + FFN</h3>
+<pre><code class="py">def forward(self, x, cond_tokens, time_emb):
+    x = x + self.self_attn(*([self.norm1(x, time_emb)] * 3))[0]            # ① 两手查询互相看
+    x = x + self.cross_attn(self.norm2(x, time_emb), cond_tokens, cond_tokens)[0]  # ② 看条件
+    x = x + self.ffn(self.norm3(x, time_emb))                             # ③ 前馈
+    return x</code></pre>
+<div class="ann">
+  <p><span class="ln">*([norm1(x)] * 3)</span> 自注意力的 Q=K=V 都用同一份归一化后的 x（标准自注意力写法），让左右手两个查询彼此交换信息。</p>
+  <p><span class="ln">cross_attn(q=x, k=v=cond_tokens)</span> <b>交叉注意力</b>：查询是手的状态 x，键值是融合后的"物体+语言"条件。这一步把"该往哪抓"注入查询。</p>
+  <p><span class="ln">x = x + ...</span> 三处都是<b>残差连接</b>，梯度好传、训练稳定。每个子层前先做 AdaLN（norm1/2/3 各带时间）。</p>
+</div>
+
+<h3>FlowMatchingTransformer：组装与前向</h3>
+<pre><code class="py">def forward(self, x_t, t, cond_tokens):
+    squeeze = False
+    if x_t.dim() == 2:                 # 兼容单手 (B,31)；双手是 (B,2,31)
+        x_t = x_t.unsqueeze(1); squeeze = True
+    time_emb = sinusoidal_embedding(t, self.time_mlp[0].in_features)
+    time_emb = self.time_mlp(time_emb)              # 时间 → 隐藏维
+    x = self.input_proj(x_t) + self.query_pos[:, :x_t.shape[1]]  # 位姿升维 + 可学习查询位置
+    cond = self.cond_proj(cond_tokens)              # 条件 768 → 256（对齐隐藏维）
+    for block in self.blocks:                       # 6 层堆叠
+        x = block(x, cond, time_emb)
+    x = self.final_norm(x)
+    v = self.output_proj(x)                         # 隐藏维 → 31，得到速度
+    return v.squeeze(1) if squeeze else v</code></pre>
+<div class="ann">
+  <p><span class="ln">query_pos</span> 形状 <code>(1, num_queries, dim)</code> 的可学习参数，给"左手/右手"两个查询各一个身份标识（位置编码）。</p>
+  <p><span class="ln">cond_proj</span> 当条件维(768)≠隐藏维(256) 时用 Linear 投影；相等则是 <code>nn.Identity()</code>。</p>
+  <p><span class="ln">output_proj</span> 最后把每个查询映射回 31 维——这就是该手位姿的"速度向量"。</p>
+</div>
+<div class="box key"><div class="t">🔑 它<b>不</b>直接输出姿势，而是输出"速度"</div>这正是流匹配的关键：模型是一个<b>速度场</b> v(x,t,c)。怎么用速度生成姿势，看下面 <code>dexvlg.py</code> 的 <code>sample</code>。</div>
+</section>
+
+<!-- DEXVLG -->
+<section id="dexvlg">
+<div class="filehead"><span class="fi">🧠</span><h2>models/dexvlg.py</h2><div class="role">总装车间<br>①②③④⑤ 串联 + 损失 + 采样</div></div>
+<p>本文件含：<code>SimpleTokenizer</code>（兜底分词器）、<code>FusionTransformer</code>（模块④）、一组 BERT 加载函数、以及主类 <code>DexVLG</code>。</p>
+
+<h3>FusionTransformer（模块④）</h3>
+<pre><code class="py">def forward(self, pc_tokens, lang_tokens, lang_mask):
+    pc   = pc_tokens   + self.pc_type_embed      # 给点 token 盖"几何"类型章
+    lang = lang_tokens + self.lang_type_embed    # 给词 token 盖"语言"类型章
+    combined = torch.cat([pc, lang], dim=1)      # 拼成 (B, 64+L, 768)
+    pc_mask = torch.ones(pc.shape[0], pc.shape[1], dtype=torch.bool, device=pc.device)
+    attn_mask = torch.cat([pc_mask, lang_mask.bool()], dim=1)
+    key_padding_mask = ~attn_mask                # True 的位置=padding，注意力会忽略
+    fused = self.encoder(combined, src_key_padding_mask=key_padding_mask)
+    return self.norm(fused)</code></pre>
+<div class="ann">
+  <p><span class="ln">type_embed</span> 两个可学习向量，让模型区分 token 来源（点 vs 词）。</p>
+  <p><span class="ln">key_padding_mask = ~attn_mask</span> 点 token 全部有效(全 1)，语言部分用真实 mask；取反后告诉 Transformer 哪些是补白、别去注意。</p>
+</div>
+
+<h3>语言模型加载：三层兜底 + "严格本地路径"</h3>
+<pre><code class="py">def _load_language_model(backbone, model_name, hidden_dim):
+    looks_local = str(model_name).startswith(("pretrained_models","models/","./","../","/","~"))
+    if looks_local:
+        _, local_only = _resolve_pretrained_path(model_name)
+        if not local_only:                       # 看着像本地路径却不存在 → 立刻报错
+            raise FileNotFoundError(...)          # 绝不静默用随机权重
+    backbone = (backbone or "bert").lower().replace("-","").replace("_","")
+    if backbone in ("modernbert","modern"):
+        return _load_modernbert(model_name, hidden_dim)
+    return _load_bert(model_name, hidden_dim)</code></pre>
+<div class="box warn"><div class="t">⚠️ 设计意图：不让你"假装在用预训练"</div>
+如果配的是本地路径但目录不存在，直接 <code>FileNotFoundError</code>；只有"非本地 HF id 离线拉取失败"才回退随机权重（给 CI/测试用）。这避免了"以为加载了预训练、其实在用随机权重白训"的坑。</div>
+
+<h3>DexVLG.__init__：把模块拼起来</h3>
+<pre><code class="py">self.pose_dim = 3 + 6 + joint_dim                 # 31（单手）
+# 分量损失权重 buffer：translation/rotation/joint 各自一段，拼成 (1,1,31)
+flow_weight = torch.cat([torch.full((3,), w_trans),
+                         torch.full((6,), w_rot),
+                         torch.full((joint_dim,), w_joint)]).view(1,1,self.pose_dim)
+self.register_buffer("flow_loss_weight", flow_weight, persistent=False)
+
+self.pc_encoder  = PointNet2Encoder(in_channels=..., num_output_tokens=64, output_dim=256)
+self.projector   = nn.Sequential(nn.Linear(256,768), nn.LayerNorm(768), nn.GELU(), nn.Linear(768,768))
+self.tokenizer, self.bert = _load_language_model(...)         # ③
+self.fusion          = FusionTransformer(dim=768, depth=4, num_heads=8)   # ④
+self.flow_transformer = FlowMatchingTransformer(pose_dim=31, num_queries=2,
+                          dim=256, depth=6, num_heads=8, cond_dim=768)     # ⑤</code></pre>
+<div class="box tip"><div class="t">💡 register_buffer 是什么</div>把 <code>flow_loss_weight</code> 注册成"buffer"——它会跟着模型搬到 GPU、存进 checkpoint，但<b>不是可训练参数</b>（不参与反向传播）。<code>persistent=False</code> 表示不写进 state_dict（因为它由配置决定、可重建）。</div>
+
+<h3>encode_condition：得到"条件 c"（①→②→③→④）</h3>
+<pre><code class="py">def encode_condition(self, xyz, rgb, texts):
+    pc_tokens = self.pc_encoder(xyz, rgb)         # ① (B,64,256)
+    pc_tokens = self.projector(pc_tokens)         # ② (B,64,768)
+    lang_features, lang_mask = self.encode_language(texts, xyz.device)  # ③ (B,L,768)
+    return self.fusion(pc_tokens, lang_features, lang_mask)  # ④ (B,64+L,768)</code></pre>
+
+<h3>compute_loss：流匹配训练损失（重点！）</h3>
+<pre><code class="py">def compute_loss(self, xyz, rgb, texts, gt_poses):
+    cond_tokens = self.encode_condition(xyz, rgb, texts)
+    t = torch.rand(B, device=device)              # 每个样本随机一个时刻 t∈[0,1]
+    noise = torch.randn_like(gt_poses)            # 一团高斯噪声 ε
+    t_expand = t[:, None, None].expand_as(gt_poses)
+    x_t = (1.0 - t_expand) * noise + t_expand * gt_poses   # 噪声↔真值 的直线插值
+    target_v = gt_poses - noise                   # 这条直线的恒定速度
+    pred_v = self.flow_transformer(x_t, t, cond_tokens)    # 模型预测速度
+    loss_fm = (self.flow_loss_weight * (pred_v - target_v) ** 2).mean()  # 加权 MSE
+    return {"loss": loss_fm, "loss_flow_matching": loss_fm}</code></pre>
+<div class="ann">
+  <p><span class="ln">x_t = (1−t)ε + t·x₁</span> t=0 时是纯噪声，t=1 时是真值，中间线性过渡。</p>
+  <p><span class="ln">target_v = x₁ − ε</span> 直线的速度恒定，与 t 无关——这就是模型要学的"标准答案速度"。</p>
+  <p><span class="ln">flow_loss_weight *</span> 逐元素乘权重：平移×3、旋转×6、关节×1，防止 22 维关节淹没平移/旋转。全 1 时即普通 MSE。</p>
+</div>
+
+<h3>sample：从噪声积分出姿势（推理）</h3>
+<pre><code class="py">@torch.no_grad()
+def sample(self, xyz, rgb, texts, num_steps=50):
+    cond_tokens = self.encode_condition(xyz, rgb, texts)
+    x = torch.randn(B, 2, self.pose_dim, device=device)    # t=0 起点：随机噪声
+    dt = 1.0 / num_steps
+    for step in range(num_steps):                          # Euler ODE 积分
+        t = torch.full((B,), step / num_steps, device=device)
+        v = self.flow_transformer(x, t, cond_tokens)       # 当前速度
+        x = x + v * dt                                     # 走一小步
+    results = {}
+    for i, hand in enumerate(["left", "right"]):           # 把 (B,2,31) 拆成两手
+        pose = x[:, i]
+        results[f"{hand}_translation"] = pose[:, :3]
+        results[f"{hand}_rotation_6d"] = pose[:, 3:9]
+        results[f"{hand}_joints"]      = pose[:, 9:]
+    return results</code></pre>
+<div class="box key"><div class="t">🔑 训练学速度，推理用速度</div>
+<code>compute_loss</code> 教模型"任意中间点的速度该是多少"；<code>sample</code> 就反过来用：从噪声出发，<b>反复问速度、走一步</b>，10~50 步后到达姿势。两者共用同一个 <code>flow_transformer</code>。</div>
+
+<h3>forward：一个入口，两种模式</h3>
+<pre><code class="py">def forward(self, xyz, rgb, texts, gt_poses=None, num_steps=50):
+    if gt_poses is not None:
+        return self.compute_loss(xyz, rgb, texts, gt_poses)   # 给了答案 → 训练
+    return self.sample(xyz, rgb, texts, num_steps)            # 没给答案 → 生成</code></pre>
+</section>
+
+<!-- DECODER -->
+<section id="decoder">
+<div class="filehead"><span class="fi">🔧</span><h2>models/pose_decoder.py</h2><div class="role">辅助工具<br>把位姿向量拆成 T/R/θ</div></div>
+<p>一个小 MLP，把某个位姿特征解码成 <code>{translation, rotation, joints}</code> 字典。</p>
+<pre><code class="py">def forward(self, x):
+    out = self.decoder(x)                          # MLP: pose_dim → 31
+    t     = out[..., :self.trans_dim]              # 前 3
+    r     = out[..., self.trans_dim:self.trans_dim+self.rot_dim]  # 中 6
+    theta = out[..., self.trans_dim+self.rot_dim:] # 后 22
+    return {"translation": t, "rotation": r, "joints": theta}</code></pre>
+<div class="box tip"><div class="t">💡 注意</div>主流程（<code>dexvlg.sample</code>）其实是<b>直接切片</b> <code>pose[:, :3]/[3:9]/[9:]</code> 拆分的，并没有用这个解码器。<code>PoseDecoder</code> 是一个独立可复用的辅助模块（README 里也标注为"辅助工具"），理解它有助于看清 31 维的固定布局即可。</div>
+</section>
+
+<!-- IO -->
+<section id="io">
+<div class="filehead"><span class="fi">📥</span><h2>data/lgbidex_io.py</h2><div class="role">数据管线的底层纯函数<br>读文件 + 坐标/旋转变换</div></div>
+<p>从 dexvlm 管线逐字移植来的一组<b>纯函数</b>，让本项目"自包含、不跨项目依赖"。挑几个关键的：</p>
+<table>
+  <tr><th>函数</th><th>作用</th></tr>
+  <tr><td><code>axis_angle_to_matrix</code></td><td>把数据集里的<b>轴角</b>旋转，用罗德里格斯公式变成旋转矩阵（再转 6D）</td></tr>
+  <tr><td><code>quaternion_to_matrix(·, order)</code></td><td>把物体位姿的四元数(支持 wxyz/xyzw)变成矩阵</td></tr>
+  <tr><td><code>transform_points</code></td><td>对点做"缩放 → 旋转 → 平移"的统一变换</td></tr>
+  <tr><td><code>shift_pose_translation</code></td><td>只平移位姿的前 3 维（把抓取移到物体中心坐标系）</td></tr>
+  <tr><td><code>sample_uniform_points_from_mesh</code></td><td>按三角面<b>面积加权</b>在网格表面均匀采点（用重心坐标）</td></tr>
+  <tr><td><code>load_point_cloud_from_ply</code> / <code>load_mesh_geometry</code></td><td>手写 PLY/OBJ 解析器，支持 ascii / 二进制、带不带颜色</td></tr>
+  <tr><td><code>normalize_rotation_6d</code></td><td>6D→矩阵→6D 走一圈，把 6D 重新正交化</td></tr>
+</table>
+<div class="box ana"><div class="t">🧩 面积加权采样为什么重要</div>
+如果对三角面"等概率"采样，大三角面和小三角面采到的点一样多，表面密度就不均。按<b>面积</b>加权（<code>torch.multinomial(face_areas, ...)</code>）才能让点在表面均匀铺开，几何更忠实。</div>
+</section>
+
+<!-- DATASET -->
+<section id="dataset">
+<div class="filehead"><span class="fi">🗂️</span><h2>data/dataset.py</h2><div class="role">把磁盘记录 → 模型输入<br>(xyz, rgb, text, pose×2)</div></div>
+<p>核心是 <code>DexGraspDataset</code>。每条 JSON 记录含：<code>obj_id, obj_pose(7), obj_scale, guidance, dex_grasp_left/right(28)</code>。<code>__getitem__</code> 把它变成模型要的格式。</p>
+
+<h3>__getitem__：一条样本的诞生</h3>
+<pre><code class="py">def __getitem__(self, idx):
+    record = self.data[idx]
+    xyz, rgb = self._build_point_cloud(record)      # 点云：加载→bbox中心化→按obj位姿摆放
+    if self.augment:
+        xyz, rgb = self._augment_point_cloud(xyz, rgb)   # 只做轻微抖动（见下方警告）
+    pose_left  = self._build_hand_pose(record, "left")   # 28维→中心化→31维→(可选)归一化
+    pose_right = self._build_hand_pose(record, "right")
+    return {"xyz":xyz, "rgb":rgb, "text":self._build_instruction(record),
+            "pose_left":pose_left, "pose_right":pose_right,
+            "obj_id":..., "cate_id":..., "group_id":group_id_of(record)}</code></pre>
+
+<h3>关键转换 1：点云的坐标处理</h3>
+<pre><code class="py">def _build_point_cloud(self, record):
+    raw_pc, has_real_color = self._load_raw_point_cloud(obj_id)   # 缓存：按物体只加载一次
+    bbox_center = self._load_mesh_bbox_center(obj_id)
+    translation, rotation, scale = self._build_object_pose(record)
+    xyz = raw_pc[:, :3] - bbox_center                # ① 平移到 bbox 中心
+    xyz = transform_points(xyz, rotation_matrix=rotation, scale=scale)  # ② 按物体旋转+缩放
+    if not self.center_on_object:                    # center_on_object=True 时物体留在原点
+        xyz = transform_points(xyz, translation=translation)
+    rgb = select_point_cloud_colors(raw_pc, ...)     # 真彩 or 常数填充
+    return xyz, rgb</code></pre>
+
+<h3>关键转换 2：抓取 28 维 → 模型 31 维</h3>
+<pre><code class="py">def _to_target_pose(self, pose):     # pose 是中心化后的 28 维
+    translation = pose[:3]
+    axis_angle  = canonicalize_axis_angle(pose[3:6])   # 轴角先规范化(角度绕到 [-π,π])
+    joints      = pose[6:6+self.joint_dim]
+    rotation    = normalize_rotation_6d(matrix_to_rotation_6d(axis_angle_to_matrix(axis_angle)))
+    return torch.cat([translation, rotation, joints], dim=-1)   # [3 + 6 + 22] = 31</code></pre>
+<div class="ann">
+  <p><span class="ln">28 → 31</span> 数据集存的是 <code>[trans(3), <b>axis_angle(3)</b>, joints(22)]</code>=28；模型要 <code>[trans(3), <b>rot6d(6)</b>, joints(22)]</code>=31。差别就在旋转：<b>轴角(3) → 6D(6)</b>。</p>
+  <p><span class="ln">canonicalize_axis_angle</span> 把旋转角绕进 [-π,π]，消除"转 370° = 转 10°"这种等价表示带来的歧义。</p>
+</div>
+
+<h3>collate_fn：把一批样本拼成 batch</h3>
+<pre><code class="py">def collate_fn(batch):
+    result = {}
+    result["xyz"] = torch.stack([b["xyz"] for b in batch])       # (B,N,3)
+    result["rgb"] = torch.stack([b["rgb"] for b in batch])
+    result["texts"] = [b["text"] for b in batch]                 # 文本保持 list（不 stack）
+    pose_left  = torch.stack([b["pose_left"]  for b in batch])
+    pose_right = torch.stack([b["pose_right"] for b in batch])
+    result["gt_poses"] = torch.stack([pose_left, pose_right], dim=1)   # (B, 2, 31)
+    ...
+    return result</code></pre>
+<div class="box key"><div class="t">🔑 gt_poses 的 (B,2,31) 就是在这里诞生的</div>左右手两个 (B,31) 在第 1 维 stack，得到 (B,2,31)——正好对应生成器的 2 个查询。</div>
+
+<div class="box warn"><div class="t">⚠️ 为什么默认关闭增广</div>
+旧版本对点云做随机旋转，但<b>只转了点云、没转抓取标签</b>，会让点云和抓取"对不上"。所以现在 <code>_augment_point_cloud</code> 只做轻微的位置/颜色抖动，且配置默认 <code>augment: false</code>。</div>
+</section>
+
+<!-- NORM -->
+<section id="norm">
+<div class="filehead"><span class="fi">⚖️</span><h2>data/pose_normalizer.py</h2><div class="role">位姿归一化<br>平移/关节 → [-1,1]</div></div>
+<p><code>LgbidexPoseNormalizer</code> 给左右手各一套 min-max 因子表，把 31 维位姿里的<b>平移和关节</b>缩放到 <code>[-1,1]</code>，<b>6D 旋转原样通过</b>。</p>
+<pre><code class="py">def normalize_pose(self, pose):
+    trans, rot6d, joints = self._split(pose)       # 拆成 3 / 6 / 22
+    if self.mode == "minmax11":
+        trans  = 2.0 * (trans  - tlo) / (thi - tlo + 1e-8) - 1.0   # 线性映射到 [-1,1]
+        joints = 2.0 * (joints - jlo) / (jhi - jlo + 1e-8) - 1.0
+    else:  # meastd11：用数据实测的均值/方差标准化
+        trans  = (trans  - trans_mean)  / (2*trans_std  + 1e-8)
+        joints = (joints - joint_mean)  / (2*joint_std  + 1e-8)
+    return torch.cat([trans, rot6d, joints], dim=-1)   # 旋转不动</code></pre>
+<div class="box tip"><div class="t">💡 为什么归一化能帮训练</div>
+流匹配的噪声先验是 N(0,1)（均值0、范围约 ±1）。把平移(米)、关节(弧度)缩放到同量级的 [-1,1]，目标分布就和噪声先验<b>更匹配</b>，模型更好学。旋转用 6D 已经天然有界，无需缩放。</div>
+<p class="small"><code>denormalize_pose</code> 是反操作，推理/验证后用它把预测变回真实米/弧度。<code>build_hand_normalizers</code> 根据配置一次造出 left/right 两套。</p>
+</section>
+
+<!-- TRAIN -->
+<section id="train">
+<div class="filehead"><span class="fi">🏋️</span><h2>train.py</h2><div class="role">训练主循环<br>DDP + 混合精度 + best-K</div></div>
+
+<h3>训练一步的核心逻辑</h3>
+<pre><code class="py">with autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):   # 混合精度
+    outputs = model(xyz, rgb, texts, gt_poses=gt_poses)        # 走 compute_loss
+    loss = outputs["loss"]
+
+if not torch.isfinite(loss):          # NaN/Inf 保险：跳过这一步，不污染权重
+    optimizer.zero_grad(set_to_none=True); scheduler.step(); continue
+
+scaler.scale(loss).backward()         # 反向（fp16 时配合梯度缩放）
+scaler.unscale_(optimizer)
+torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)  # 梯度裁剪防爆炸
+scaler.step(optimizer); scaler.update(); scheduler.step()</code></pre>
+<div class="box warn"><div class="t">⚠️ bf16 vs fp16（修改记录里的真实踩坑）</div>
+fp16 下 ModernBERT/PointNet 激活可能<b>溢出成 inf</b>，污染 BatchNorm 的 running 统计量，导致<b>永久 NaN</b>（GradScaler 只能跳过 optimizer step、救不了 forward 阶段被污染的 buffer）。所以 H100 上推荐 <code>precision: bf16</code>（范围等同 fp32、不溢出、且关闭梯度缩放）。<code>get_amp_settings</code> 负责解析这个配置。</div>
+
+<h3>validate：采样式验证（不是训练损失！）</h3>
+<pre><code class="py">with autocast(...):
+    pred = net.sample(xyz, rgb, texts, num_steps=num_steps)   # 跑完整 ODE 采样
+# 反归一化回真实单位，再分别算三项误差：
+#   trans = 欧氏距离(米)   rot = 测地角(弧度)   joint = L1(弧度)
+sums[0]+=trans...; sums[1]+=rot...; sums[2]+=joint...
+return {"trans":..., "rot":..., "joint":..., "score": trans+rot+joint}</code></pre>
+<div class="ann">
+  <p><span class="ln">net.sample(...)</span> 验证用的是<b>真实采样</b>（生成完整姿势再比对），比训练时的"单步流匹配损失"更能反映真实效果。</p>
+  <p><span class="ln">val_group_min 分支</span> 开启后，每个预测与"同 (obj_id,pose_id,guidance) 组的所有 GT"比，取联合误差最小的候选——避免合法但不同的抓法被误判。</p>
+  <p><span class="ln">score = trans+rot+joint</span> 三项之和作为选 checkpoint 的总分，越小越好。</p>
+</div>
+
+<h3>best-K 检查点管理</h3>
+<pre><code class="py">def update_best_checkpoints(registry, score, keep_best_k, ...):
+    if len(registry) &gt;= keep_best_k and score &gt;= registry[-1][0]:
+        return registry, False                 # 不够好，不进 top-K
+    path = f"best_e{epoch:04d}_s{score:.4f}.pt"
+    save_fn(path); registry.append((score, path)); registry.sort()
+    while len(registry) &gt; keep_best_k:
+        _, drop = registry.pop(); os.remove(drop)   # 淘汰最差的
+    return registry, True</code></pre>
+<div class="box tip"><div class="t">💡 其它训练设施</div>
+<code>get_cosine_schedule_with_warmup</code>（学习率先线性预热、再余弦衰减）、<code>setup_distributed</code>（严格判断 torchrun 环境变量才进 DDP，避免残留 RANK 误触发）、<code>GroupedEpochSampler</code>（每 epoch 从每组抽样，见 <code>data/samplers.py</code>）、<code>scan_best_checkpoints</code>（resume 时从文件名重建 registry）。</div>
+</section>
+
+<!-- TEST -->
+<section id="test">
+<div class="filehead"><span class="fi">📊</span><h2>test.py</h2><div class="role">测试集评估<br>5 个指标</div></div>
+<pre><code class="py">def compute_metrics(pred_poses, gt_poses, ...):
+    for i, hand in enumerate(["left","right"]):
+        trans_err = torch.norm(pred_trans - gt_trans, dim=-1).mean()    # 平移欧氏距离
+        metrics[f"{hand}/trans_err_cm"] = trans_err * 100               # → 厘米
+        rot_err = geodesic_distance(rotation_6d_to_matrix(pred_rot6d),
+                                    rotation_6d_to_matrix(gt_rot6d))    # 旋转测地角
+        metrics[f"{hand}/rot_err_deg"] = torch.rad2deg(rot_err).mean()  # → 度
+        metrics[f"{hand}/joint_err_deg"] = np.degrees(torch.abs(pred_joints-gt_joints).mean())
+        metrics[f"{hand}/trans_success_2cm"]  = (dist &lt; 0.02).float().mean()   # 成功率
+        metrics[f"{hand}/rot_success_15deg"]  = (rot_err &lt; radians(15)).float().mean()</code></pre>
+<div class="ann">
+  <p><span class="ln">geodesic_distance</span> 两个旋转矩阵的"夹角"：<code>acos((trace(R1ᵀR2)−1)/2)</code>，带 <code>clamp(-1,1)</code> 防数值越界。</p>
+  <p><span class="ln">success_2cm / 15deg</span> 不只看平均误差，还看"有多大比例落在可接受阈值内"——更贴近"抓得成不成"。</p>
+</div>
+<p class="small"><code>evaluate</code> 遍历测试集、采样、(可选)反归一化、累计指标；<code>--save_predictions</code> 时把每条预测存成 JSON。</p>
+</section>
+
+<!-- INFER -->
+<section id="infer">
+<div class="filehead"><span class="fi">🔮</span><h2>inference.py</h2><div class="role">单物体推理 Demo</div></div>
+<p>从一个网格文件采点 → 生成双手抓取 → 打印 + 可视化。流程很直白：</p>
+<pre><code class="py">xyz_np, rgb_np = sample_point_cloud_from_mesh(args.mesh_path, n_points, args.scale)
+result = model.sample(xyz, rgb, [args.instruction], num_steps=args.num_steps)
+# 若开了归一化，反归一化回真实单位
+if normalizers is not None:
+    pose = normalizers[hand].denormalize_pose(pose) ...
+# 6D 旋转 → 四元数(wxyz)，打印手腕位置/朝向/关节
+quat = rotation_6d_to_quaternion(rot6d.unsqueeze(0)).squeeze(0)
+# 可选：Open3D 画出点云 + 双手坐标系
+visualize_grasp(xyz_np, rgb_np, left_skel, right_skel, save_path=args.output)</code></pre>
+<div class="box tip"><div class="t">💡 这是体会"端到端"的最好入口</div>给一个 mesh、写一句话，就能看到模型输出的左右手姿势。想直观感受模型，先跑它。</div>
+</section>
+
+<!-- SANITY -->
+<section id="sanity">
+<div class="filehead"><span class="fi">✅</span><h2>test_sanity.py</h2><div class="role">CPU 自检 · 4 个测试</div></div>
+<p>不需要 GPU、不需要真实数据，纯靠随机张量验证"形状对不对、能不能前向"。新手第一步就该跑它。</p>
+<table>
+  <tr><th>测试</th><th>验证什么</th></tr>
+  <tr><td><code>test_rotation_utils</code></td><td>四元数↔6D 往返一致；6D→矩阵对单位四元数得到单位阵</td></tr>
+  <tr><td><code>test_pointnet2</code></td><td>编码器输出形状 <span class="shape">(B, 32, 128)</span> 正确</td></tr>
+  <tr><td><code>test_flow_matching</code></td><td>速度场输出形状 = 输入形状 <span class="shape">(B, 2, 31)</span></td></tr>
+  <tr><td><code>test_dexvlg_forward</code></td><td>完整模型：训练 loss 是标量 + 采样输出双手 translation/joints 形状对</td></tr>
+</table>
+<pre><code class="py"># 运行：
+python test_sanity.py
+# 期望最后打印 Results: 4/4 passed</code></pre>
+</section>
+
+<!-- CONNECT -->
+<section id="connect">
+<div class="filehead"><span class="fi">🔗</span><h2>调用关系串讲</h2><div class="role">把所有文件连成一条线</div></div>
+<p>用一次"训练迭代"把所有文件穿起来：</p>
+<pre><code class="py">train.py:main()
+ └─ DexGraspDataset(...)                      # data/dataset.py
+     ├─ _build_point_cloud  → lgbidex_io.load_point_cloud_from_ply / transform_points
+     ├─ _build_hand_pose    → lgbidex_io.axis_angle_to_matrix → rotation 6D
+     └─ (可选) pose_normalizer.normalize_pose
+ └─ DataLoader(collate_fn) → batch{xyz, rgb, texts, gt_poses(B,2,31)}
+ └─ DexVLG(cfg).forward(xyz,rgb,texts, gt_poses)   # models/dexvlg.py
+     └─ compute_loss:
+         ├─ encode_condition:
+         │    ├─ PointNet2Encoder          # ① models/pointnet2.py
+         │    ├─ projector (Linear×2)      # ②
+         │    ├─ bert(input_ids,mask)      # ③ (Modern)BERT
+         │    └─ FusionTransformer         # ④
+         └─ flow_transformer(x_t,t,cond)   # ⑤ models/flow_matching.py → 预测速度
+     └─ loss = 加权MSE(pred_v, gt−noise)
+ └─ loss.backward() → optimizer.step()     # 更新所有模块参数
+ └─ 每隔若干 epoch: validate() → model.sample()(跑ODE) → 反归一化 → 算指标 → best-K 保存</code></pre>
+<div class="box key"><div class="t">🔑 看懂这张图，你就掌握了整个工程</div>
+数据从 <code>dataset.py</code> 出发，经 <code>collate_fn</code> 打包，进 <code>dexvlg.py</code> 的 5 个模块算出损失，反向传播更新参数；验证时改走 <code>sample</code> 生成真实姿势并用 <code>test.py</code> 同款指标打分。<b>所有文件各司其职，主线只有一条。</b></div>
+</section>
+
+<div class="footer">
+  本文档为 DexVLG 项目的<b>逐代码讲解</b>（小白友好版）。配套文档：《DexVLG 全模型架构精讲》。<br>
+  代码片段为讲解目的做了适度精简/省略（用 <code>...</code> 标注），完整实现以仓库源码为准。
+</div>
+</main>
+</div>
+
+<script>
+// ── 轻量 Python 语法高亮（自包含，无外部依赖）──
+(function(){
+  var KW = new Set(("False None True and as assert async await break class continue def del elif else "+
+    "except finally for from global if import in is lambda nonlocal not or pass raise return try while "+
+    "with yield self cls").split(" "));
+  var BI = new Set(("print len range int float str list dict tuple set bool super isinstance enumerate zip "+
+    "sum max min abs torch nn F np open sorted getattr setattr hasattr type reshape view cat stack norm "+
+    "randn rand full zeros ones expand unsqueeze squeeze").split(" "));
+  function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+  function isIdS(c){return /[A-Za-z_]/.test(c);}
+  function isId(c){return /[A-Za-z0-9_]/.test(c);}
+  function hl(code){
+    var i=0,n=code.length,out="",prev="";
+    while(i<n){
+      var c=code[i];
+      // 注释
+      if(c==="#"){var j=i;while(j<n&&code[j]!=="\n")j++;out+='<span class="c">'+esc(code.slice(i,j))+'</span>';i=j;continue;}
+      // 三引号字符串
+      if((c==='"'||c==="'")&&code.slice(i,i+3)===c+c+c){
+        var q=c+c+c,j=i+3;while(j<n&&code.slice(j,j+3)!==q)j++;j=Math.min(n,j+3);
+        out+='<span class="s">'+esc(code.slice(i,j))+'</span>';i=j;continue;}
+      // 单/双引号字符串
+      if(c==='"'||c==="'"){var j=i+1;while(j<n&&code[j]!==c){if(code[j]==="\\")j++;j++;}j=Math.min(n,j+1);
+        out+='<span class="s">'+esc(code.slice(i,j))+'</span>';i=j;continue;}
+      // 装饰器
+      if(c==="@"){var j=i+1;while(j<n&&isId(code[j]))j++;out+='<span class="dec">'+esc(code.slice(i,j))+'</span>';i=j;continue;}
+      // 数字
+      if(/[0-9]/.test(c)&&!isId(prev)){
+        var m=code.slice(i).match(/^(0[xX][0-9a-fA-F]+|\d+\.?\d*([eE][+-]?\d+)?|\.\d+([eE][+-]?\d+)?)/);
+        if(m){out+='<span class="num">'+esc(m[0])+'</span>';i+=m[0].length;prev="0";continue;}}
+      // 标识符
+      if(isIdS(c)){var j=i;while(j<n&&isId(code[j]))j++;var w=code.slice(i,j);
+        var after=code.slice(j).match(/^\s*\(/);
+        if(KW.has(w))out+='<span class="kw">'+esc(w)+'</span>';
+        else if(prev==="def "||prev==="class ")out+='<span class="fn">'+esc(w)+'</span>';
+        else if(BI.has(w))out+='<span class="bi">'+esc(w)+'</span>';
+        else if(after)out+='<span class="fn">'+esc(w)+'</span>';
+        else out+=esc(w);
+        // 记录 def/class 以便给下一个标识符上色
+        prev=(w==="def"||w==="class")?w+" ":w;
+        i=j;continue;}
+      out+=esc(c);
+      if(!/\s/.test(c))prev=c; else if(c===" "&&(prev==="def"||prev==="class"))prev=prev+" ";
+      i++;
+    }
+    return out;
+  }
+  document.querySelectorAll("pre code.py").forEach(function(el){
+    el.innerHTML=hl(el.textContent);
+  });
+})();
+</script>
+</body>
+</html>

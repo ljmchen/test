@@ -25,12 +25,18 @@ def knn(x: torch.Tensor, k: int) -> torch.Tensor:
     return dist.topk(k, largest=False).indices
 
 
-def farthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
+def farthest_point_sample(
+    xyz: torch.Tensor, npoint: int, deterministic: bool = False
+) -> torch.Tensor:
     """Farthest point sampling.
 
     Args:
         xyz: Point positions, shape (B, N, 3).
         npoint: Number of points to sample.
+        deterministic: Start from point index 0 instead of a random point.
+            Used at eval time so inference is reproducible and independent
+            of batch composition; training keeps the random start (acts as
+            a mild augmentation).
 
     Returns:
         Indices of sampled points, shape (B, npoint).
@@ -39,7 +45,10 @@ def farthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
     device = xyz.device
     centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
     distance = torch.full((B, N), 1e10, device=device)
-    farthest = torch.randint(0, N, (B,), device=device)
+    if deterministic:
+        farthest = torch.zeros(B, dtype=torch.long, device=device)
+    else:
+        farthest = torch.randint(0, N, (B,), device=device)
 
     for i in range(npoint):
         centroids[:, i] = farthest
@@ -137,7 +146,9 @@ class SetAbstraction(nn.Module):
         """
         B, N, _ = xyz.shape
 
-        fps_idx = farthest_point_sample(xyz, self.npoint)
+        fps_idx = farthest_point_sample(
+            xyz, self.npoint, deterministic=not self.training
+        )
         new_xyz = index_points(xyz, fps_idx)
 
         group_idx = ball_query(xyz, new_xyz, self.radius, self.nsample)

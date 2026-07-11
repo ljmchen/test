@@ -56,9 +56,26 @@ class FlowMatchingBlock(nn.Module):
         x: torch.Tensor,
         cond_tokens: torch.Tensor,
         time_emb: torch.Tensor,
+        memory_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """
+        Args:
+            x: Query tokens, shape (B, Q, dim).
+            cond_tokens: Cross-attention memory, shape (B, L, dim).
+            time_emb: Timestep embedding, shape (B, dim).
+            memory_key_padding_mask: Optional bool mask over cond_tokens,
+                shape (B, L); True = pad (ignored by cross-attention).
+
+        Returns:
+            Updated query tokens, shape (B, Q, dim).
+        """
         x = x + self.self_attn(*([self.norm1(x, time_emb)] * 3))[0]
-        x = x + self.cross_attn(self.norm2(x, time_emb), cond_tokens, cond_tokens)[0]
+        x = x + self.cross_attn(
+            self.norm2(x, time_emb),
+            cond_tokens,
+            cond_tokens,
+            key_padding_mask=memory_key_padding_mask,
+        )[0]
         x = x + self.ffn(self.norm3(x, time_emb))
         return x
 
@@ -117,7 +134,7 @@ class FlowMatchingTransformer(nn.Module):
         hi = hand_interaction or {}
         self.use_hand_type_embed = bool(hi.get("enabled", False))
         if self.use_hand_type_embed:
-            self.hand_type_embed = nn.Embedding(num_queries, dim)
+            self.hand_type_embed = nn.Embedding(max(num_queries, 2), dim)
             if bool(hi.get("cross_hand_attn", False)):
                 self.cross_hand_norm = nn.LayerNorm(dim)
                 self.cross_hand_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
@@ -131,6 +148,8 @@ class FlowMatchingTransformer(nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         cond_tokens: torch.Tensor,
+        hand_ids: torch.Tensor | None = None,
+        memory_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict velocity field v(x_t, t, c).
 
@@ -138,6 +157,12 @@ class FlowMatchingTransformer(nn.Module):
             x_t: Noisy pose, shape (B, num_queries, pose_dim) or (B, pose_dim).
             t: Timestep in [0, 1], shape (B,).
             cond_tokens: Condition features, shape (B, L, cond_dim).
+            hand_ids: Optional hand side ids (0=left, 1=right), shape (B,).
+                When given, the hand type embedding is indexed by hand side
+                semantics; when None, the legacy slot-arange behavior is kept.
+            memory_key_padding_mask: Optional bool mask over cond_tokens,
+                shape (B, L); True = pad (excluded from cross-attention).
+                None keeps the legacy all-visible behavior.
 
         Returns:
             Predicted velocity, same shape as x_t.
@@ -152,12 +177,17 @@ class FlowMatchingTransformer(nn.Module):
 
         x = self.input_proj(x_t) + self.query_pos[:, : x_t.shape[1]]
         if self.use_hand_type_embed:
-            hand_ids = torch.arange(x.shape[1], device=x.device)
-            x = x + self.hand_type_embed(hand_ids).unsqueeze(0)
+            if hand_ids is not None:
+                x = x + self.hand_type_embed(hand_ids).unsqueeze(1)
+            else:
+                slot_ids = torch.arange(x.shape[1], device=x.device)
+                x = x + self.hand_type_embed(slot_ids).unsqueeze(0)
         cond = self.cond_proj(cond_tokens)
 
         for block in self.blocks:
-            x = block(x, cond, time_emb)
+            x = block(
+                x, cond, time_emb, memory_key_padding_mask=memory_key_padding_mask
+            )
 
         if self.cross_hand_attn is not None:
             x = x + self.cross_hand_attn(*([self.cross_hand_norm(x)] * 3))[0]

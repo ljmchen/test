@@ -51,6 +51,7 @@ from data.lgbidex_io import (
     normalize_point_cloud_color_mode,
     normalize_rotation_6d,
     quaternion_to_matrix,
+    resolve_obj_scale,
     sample_uniform_points_from_mesh,
     select_point_cloud_colors,
     shift_pose_translation,
@@ -63,9 +64,24 @@ SINGLE_HAND_RAW_POSE_DIM = 28  # [trans(3), axis_angle(3), joints(22)]
 
 
 def group_id_of(record: dict) -> str:
-    """Stable (obj_id, pose_id, guidance) group id; tolerates the guidence spelling."""
+    """Stable (obj_id, pose_id, scale_id, guidance) group id; tolerates the guidence spelling."""
     guidance = record.get("guidance", record.get("guidence", ""))
-    return f"{record.get('obj_id', '')}|{record.get('pose_id', 0)}|{guidance}"
+    return (
+        f"{record.get('obj_id', '')}|{record.get('pose_id', 0)}|"
+        f"{record.get('scale_id', 0)}|{guidance}"
+    )
+
+
+def hands_present(record: dict) -> list[str]:
+    """Hand sides with a non-empty ``dex_grasp_{side}`` entry, left-first.
+
+    Args:
+        record: Split record.
+
+    Returns:
+        Subset of ``["left", "right"]`` in canonical (left-first) order.
+    """
+    return [side for side in HAND_SIDES if record.get(f"dex_grasp_{side}")]
 
 
 def sample_point_cloud_from_mesh(
@@ -115,6 +131,7 @@ class DexGraspDataset(Dataset):
         center_on_object: bool = True,
         obj_pose_quaternion_order: str = "wxyz",
         normalization: dict | None = None,
+        multi_task: bool = False,
     ):
         """
         Args:
@@ -135,6 +152,11 @@ class DexGraspDataset(Dataset):
                 enabled, target poses are min-max normalized to ``[-1, 1]``
                 per hand (translation + joints); the flow model then trains on
                 normalized poses and callers must denormalize predictions.
+            multi_task: Config key ``data.multi_task``. When true, items expose
+                the variable-hand contract (``hand_poses`` / ``hand_side_ids`` /
+                ``L_obj`` / ``task_type``) and every required record field must
+                be present (no fallbacks). When false, the legacy bimanual
+                item/collate behavior is preserved bit-for-bit.
         """
         if point_cloud_source not in {"auto", "colored_ply", "mesh_sample"}:
             raise ValueError(f"Unsupported point_cloud_source '{point_cloud_source}'.")
@@ -156,13 +178,14 @@ class DexGraspDataset(Dataset):
         self.point_cloud_file_points = str(self.n_points if point_cloud_file_points is None else point_cloud_file_points)
         self.center_on_object = bool(center_on_object)
         self.obj_pose_quaternion_order = obj_pose_quaternion_order
+        self.multi_task = bool(multi_task)
         # per-hand pose normalizers (None when normalization disabled)
         self.normalizers = build_hand_normalizers(normalization, joint_dim=self.joint_dim)
 
         # Cache the raw (pre-transform) per-object geometry so the cache size is
         # bounded by the number of unique objects, not the number of records.
         self._raw_pc_cache: dict[str, tuple[torch.Tensor, bool]] = {}
-        self._bbox_center_cache: dict[str, torch.Tensor] = {}
+        self._bbox_center_cache: dict[str, tuple[torch.Tensor, float]] = {}
 
     def __len__(self) -> int:
         return len(self.data)
@@ -191,14 +214,24 @@ class DexGraspDataset(Dataset):
             raise ValueError(f"Expected obj_pose dim 7, got {obj_pose.shape[-1]}.")
         translation = obj_pose[:3]
         rotation_matrix = quaternion_to_matrix(obj_pose[3:], order=self.obj_pose_quaternion_order)
-        scale = float(record.get("obj_scale", 0.1))
+        scale = resolve_obj_scale(record)
         return translation, rotation_matrix, scale
 
-    def _load_mesh_bbox_center(self, obj_id: str) -> torch.Tensor:
+    def _load_mesh_bbox(self, obj_id: str) -> tuple[torch.Tensor, float]:
         if obj_id not in self._bbox_center_cache:
             vertices = load_mesh_vertices(self._resolve_mesh_path(obj_id))
-            self._bbox_center_cache[obj_id] = 0.5 * (vertices.min(dim=0).values + vertices.max(dim=0).values)
+            mn = vertices.min(dim=0).values
+            mx = vertices.max(dim=0).values
+            self._bbox_center_cache[obj_id] = (0.5 * (mn + mx), float((mx - mn).norm()))
         return self._bbox_center_cache[obj_id]
+
+    def _load_mesh_bbox_center(self, obj_id: str) -> torch.Tensor:
+        return self._load_mesh_bbox(obj_id)[0]
+
+    def _object_scale_length(self, record: dict) -> float:
+        """Object characteristic length L_obj = mesh bbox diagonal x resolved scale."""
+        diag = self._load_mesh_bbox(str(record["obj_id"]))[1]
+        return diag * resolve_obj_scale(record)
 
     def _build_object_center_offset(self, record: dict) -> torch.Tensor:
         bbox_center = self._load_mesh_bbox_center(str(record["obj_id"]))
@@ -285,12 +318,12 @@ class DexGraspDataset(Dataset):
         rotation = normalize_rotation_6d(matrix_to_rotation_6d(axis_angle_to_matrix(axis_angle)))
         return torch.cat([translation, rotation, joints], dim=-1)
 
-    def _build_hand_pose(self, record: dict, side: str) -> torch.Tensor:
+    def _build_hand_pose(self, record: dict, side: str, L_obj: float | None = None) -> torch.Tensor:
         raw = torch.tensor(record[f"dex_grasp_{side}"], dtype=torch.float32)
         centered = self._center_hand_pose(raw, record)
         pose = self._to_target_pose(centered)
         if self.normalizers is not None:
-            pose = self.normalizers[side].normalize_pose(pose)
+            pose = self.normalizers[side].normalize_pose(pose, L_obj=L_obj)
         return pose
 
     # ─── Augmentation (pose-preserving) ───────────────────────────────────
@@ -333,7 +366,36 @@ class DexGraspDataset(Dataset):
             "text": self._build_instruction(record),
             "object_translation": translation,
             "object_center_offset": center_offset,
+            "L_obj": float(self._object_scale_length(record)),
+            "hand_side_ids": [0 if side == "left" else 1 for side in hands_present(record)],
+            "task_type": str(record.get("task_type", "")),
             "record": record,
+        }
+
+    def _getitem_multi_task(self, idx: int, record: dict, xyz: torch.Tensor, rgb: torch.Tensor) -> dict:
+        obj_id = str(record.get("obj_id", ""))
+        task_type = record.get("task_type")
+        if not task_type:
+            raise ValueError(f"Record idx={idx} obj_id={obj_id!r} is missing 'task_type'.")
+        guidance = str(record.get("guidance", record.get("guidence", ""))).strip()
+        if not guidance:
+            raise ValueError(f"Record idx={idx} obj_id={obj_id!r} has missing/empty 'guidance'.")
+        sides = hands_present(record)
+        if not sides:
+            raise ValueError(f"Record idx={idx} obj_id={obj_id!r} has no dex_grasp_left/right.")
+        L_obj = self._object_scale_length(record)
+
+        return {
+            "xyz": xyz,
+            "rgb": rgb,
+            "text": guidance,
+            "hand_poses": [self._build_hand_pose(record, side, L_obj) for side in sides],
+            "hand_side_ids": [0 if side == "left" else 1 for side in sides],
+            "L_obj": float(L_obj),
+            "task_type": str(task_type),
+            "obj_id": obj_id,
+            "cate_id": str(record.get("cate_id", "")),
+            "group_id": group_id_of(record),
         }
 
     def __getitem__(self, idx: int) -> dict:
@@ -341,6 +403,9 @@ class DexGraspDataset(Dataset):
         xyz, rgb = self._build_point_cloud(record)
         if self.augment:
             xyz, rgb = self._augment_point_cloud(xyz, rgb)
+
+        if self.multi_task:
+            return self._getitem_multi_task(idx, record, xyz, rgb)
 
         pose_left = self._build_hand_pose(record, "left")
         pose_right = self._build_hand_pose(record, "right")
@@ -359,15 +424,43 @@ class DexGraspDataset(Dataset):
         }
 
 
+def _collate_multi_task(batch: list[dict], result: dict) -> dict:
+    num_slots = len(HAND_SIDES)
+    pose_dim = batch[0]["hand_poses"][0].shape[-1]
+    gt_poses = torch.zeros(len(batch), num_slots, pose_dim, dtype=torch.float32)
+    hand_mask = torch.zeros(len(batch), num_slots, dtype=torch.bool)
+    hand_side_ids = torch.full((len(batch), num_slots), -1, dtype=torch.long)
+    for i, item in enumerate(batch):
+        for slot, (pose, side_id) in enumerate(zip(item["hand_poses"], item["hand_side_ids"])):
+            gt_poses[i, slot] = pose
+            hand_mask[i, slot] = True
+            hand_side_ids[i, slot] = side_id
+    result["gt_poses"] = gt_poses
+    result["hand_mask"] = hand_mask
+    result["hand_side_ids"] = hand_side_ids
+    result["L_obj"] = torch.tensor([b["L_obj"] for b in batch], dtype=torch.float32)
+    result["task_types"] = [b["task_type"] for b in batch]
+    return result
+
+
 def collate_fn(batch: list[dict]) -> dict:
-    """Custom collate that stacks tensors and keeps text fields as lists."""
+    """Custom collate that stacks tensors and keeps text fields as lists.
+
+    Legacy items (``pose_left``/``pose_right``) yield the original contract.
+    Multi-task items (``hand_poses``) yield ``gt_poses (B, 2, 31)`` zero-padded
+    in canonical order, plus ``hand_mask (B, 2)`` bool, ``hand_side_ids (B, 2)``
+    long (-1 pad), ``L_obj (B,)`` float32, and ``task_types`` list[str].
+    """
     result = {}
     result["xyz"] = torch.stack([b["xyz"] for b in batch])
     result["rgb"] = torch.stack([b["rgb"] for b in batch])
     result["texts"] = [b["text"] for b in batch]
-    pose_left = torch.stack([b["pose_left"] for b in batch])
-    pose_right = torch.stack([b["pose_right"] for b in batch])
-    result["gt_poses"] = torch.stack([pose_left, pose_right], dim=1)
+    if "hand_poses" in batch[0]:
+        result = _collate_multi_task(batch, result)
+    else:
+        pose_left = torch.stack([b["pose_left"] for b in batch])
+        pose_right = torch.stack([b["pose_right"] for b in batch])
+        result["gt_poses"] = torch.stack([pose_left, pose_right], dim=1)
     result["obj_ids"] = [b["obj_id"] for b in batch]
     result["cate_ids"] = [b["cate_id"] for b in batch]
     result["group_ids"] = [b["group_id"] for b in batch]

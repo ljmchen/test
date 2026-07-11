@@ -104,6 +104,31 @@ def quaternion_to_matrix(quaternion: torch.Tensor, order: str = "wxyz") -> torch
     )
 
 
+# ─── Record field resolution ───────────────────────────────────────────────
+
+
+def resolve_obj_scale(record: dict) -> float:
+    """Resolve the object scale of a split record.
+
+    Args:
+        record: Split record; uses ``obj_scale`` when present, else ``scale_id / 100``.
+
+    Returns:
+        Object scale as a float.
+
+    Raises:
+        ValueError: If the record has neither ``obj_scale`` nor ``scale_id``.
+    """
+    if record.get("obj_scale") is not None:
+        return float(record["obj_scale"])
+    if record.get("scale_id") is not None:
+        return float(record["scale_id"]) / 100.0
+    raise ValueError(
+        f"Record obj_id={record.get('obj_id', '<unknown>')!r} has neither "
+        f"'obj_scale' nor 'scale_id'; cannot resolve object scale."
+    )
+
+
 # ─── Point / pose transforms ───────────────────────────────────────────────
 
 

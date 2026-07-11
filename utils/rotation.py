@@ -85,9 +85,14 @@ def matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
     quat[mask, 2] = (m[mask, 0, 2] - m[mask, 2, 0]) / s[mask]
     quat[mask, 3] = (m[mask, 1, 0] - m[mask, 0, 1]) / s[mask]
 
+    # trace<=0 branch: pick the axis by argmax over the diagonal. Strict ">"
+    # comparisons would leave rows with tied diagonal maxima (e.g. a 180-deg
+    # rotation about [1,1,0]/sqrt(2) or [1,1,1]/sqrt(3)) matching NO branch,
+    # yielding an all-zero quaternion; argmax hits exactly one branch per row.
+    best = torch.stack([m[:, 0, 0], m[:, 1, 1], m[:, 2, 2]], dim=-1).argmax(dim=-1)
     for i in range(3):
         j, k = (i + 1) % 3, (i + 2) % 3
-        cond = (~mask) & (m[:, i, i] > m[:, j, j]) & (m[:, i, i] > m[:, k, k])
+        cond = (~mask) & (best == i)
         if not cond.any():
             continue
         s_i = torch.sqrt(

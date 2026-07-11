@@ -1,3 +1,6 @@
+# ⚠️ v4/afs 时代遗留配置，仅存档（2026-07-10 移入 legacy/，原 configs/default.yaml）。
+#    数据路径指向已失效的 /mnt/afs（本机不可达），且缺 model.architecture 等 v3 键。
+#    现行配置：configs/v3_multitask.yaml（正式）/ configs/v3_smoke.yaml（冒烟）。
 # DexVLG Default Configuration
 # Bimanual dexterous grasp generation with language guidance
 
@@ -122,6 +125,9 @@ training:
   val_interval: 1             # sampling-based validation every N epochs (not steps)
   val_max_batches: 0         # cap validation to N batches per run (0 = full val set)
   keep_best_k: 3              # keep only the best-K checkpoints by val score
+  # last.pt is refreshed every epoch (for resume); additionally keep a numbered
+  # snapshot epoch_XXXX.pt every `save_interval` epochs (0 = disable snapshots).
+  save_interval: 20
   # Per-component validation metric. true -> MSE (mean squared error);
   # false -> physical metric (translation L2 distance / rotation geodesic angle / joint L1).
   val_loss_mse:

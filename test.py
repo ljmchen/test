@@ -4,8 +4,8 @@ Loads a trained checkpoint, runs inference on a test set, and computes
 evaluation metrics for both left and right hand grasp predictions.
 
 Usage:
-    python test.py --config configs/default.yaml --checkpoint checkpoints/best.pt \
-                   [--num_steps 50] [--output_dir results/]
+    python test.py --config configs/v3_multitask.yaml --checkpoint checkpoints/best.pt \
+                   [--num_steps 50] [--output_dir results/] [--use-ema] [--val-max-batches 0]
 """
 
 import argparse
@@ -21,6 +21,11 @@ from tqdm import tqdm
 from data.dataset import DexGraspDataset, collate_fn
 from data.pose_normalizer import build_hand_normalizers
 from models.dexvlg import DexVLG
+from train import (
+    build_group_candidates_multitask,
+    format_multitask_val_table,
+    validate_multitask,
+)
 from utils.rotation import rotation_6d_to_matrix
 from utils.misc import set_seed
 
@@ -49,11 +54,20 @@ def denormalize_predictions(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate DexVLG model")
-    parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser.add_argument("--config", type=str, default="configs/v3_multitask.yaml")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--num_steps", type=int, default=50)
+    parser.add_argument("--use-ema", action="store_true",
+                        help="Load ema_state_dict (the weights the validation "
+                             "score was computed with when EMA was on) instead "
+                             "of the raw model_state_dict.")
+    parser.add_argument("--num_steps", type=int, default=None,
+                        help="ODE steps (default: config inference.num_steps or 50).")
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--val-max-batches", type=int, default=-1,
+                        help="latent_ar: cap validated batches (>=0 overrides "
+                             "training.val_max_batches; -1 keeps the config value).")
     parser.add_argument("--save_predictions", action="store_true")
     return parser.parse_args()
 
@@ -150,7 +164,7 @@ def evaluate(
         gt_poses = batch["gt_poses"].to(device)
         texts = batch["texts"]
 
-        with autocast("cuda", enabled=True):
+        with autocast(device.type, enabled=device.type == "cuda"):
             pred_poses = model.sample(xyz, rgb, texts, num_steps=num_steps)
 
         if normalizers is not None:
@@ -179,24 +193,11 @@ def evaluate(
     return aggregated, predictions
 
 
-def main():
-    args = parse_args()
-    with open(args.config, "r") as f:
-        cfg = yaml.safe_load(f)
-    set_seed(cfg["training"].get("seed", 42))
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    print("Loading model...")
-    model = DexVLG(cfg["model"]).cuda()
-    ckpt = torch.load(args.checkpoint, map_location="cuda", weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    print(f"Loaded checkpoint from epoch {ckpt.get('epoch', '?')}")
-
+def build_test_dataset(cfg: dict, multi_task: bool) -> DexGraspDataset:
+    """Construct the test-split ``DexGraspDataset`` from the config."""
     data_cfg = cfg["data"]
     test_path = data_cfg.get("test_data", data_cfg.get("val_data"))
-
-    test_dataset = DexGraspDataset(
+    return DexGraspDataset(
         data_path=test_path,
         mesh_root=data_cfg["mesh_root"],
         n_points=data_cfg.get("n_points", 4096),
@@ -209,31 +210,142 @@ def main():
         center_on_object=data_cfg.get("center_on_object", True),
         obj_pose_quaternion_order=data_cfg.get("obj_pose_quaternion_order", "wxyz"),
         normalization=data_cfg.get("normalization", None),
+        multi_task=multi_task,
     )
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
+
+
+def evaluate_latent_ar(
+    model: DexVLG,
+    cfg: dict,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> dict:
+    """Offline per-task-type multi-task evaluation for the latent_ar model.
+
+    Reuses ``train.validate_multitask``: a free rollout for decision metrics and
+    a forced-decision rollout for pose errors (denormalized with per-sample
+    ``L_obj``), bucketed by task type. Returns the ``validate_multitask`` metrics
+    dict (``score``/``per_task``/``macro``/``bimanual``/``trans``/``rot``/``joint``).
+    """
+    dataset = build_test_dataset(cfg, multi_task=True)
+    # Deterministic shuffle: the fuse splits are stored as contiguous
+    # task_type blocks, so a val_max_batches cap over sequential order would
+    # silently evaluate a single scenario.
+    order_gen = torch.Generator()
+    order_gen.manual_seed(int(cfg["training"].get("seed", 42)))
+    fixed_order = torch.randperm(len(dataset), generator=order_gen).tolist()
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        sampler=fixed_order,
+        num_workers=cfg["training"].get("num_workers", 4),
+        collate_fn=collate_fn,
+        pin_memory=device.type == "cuda",
+    )
+    normalizers = build_hand_normalizers(
+        cfg["data"].get("normalization", None), joint_dim=cfg["model"].get("joint_dim", 22)
+    )
+    group_candidates = None
+    if bool(cfg["training"].get("val_group_min", False)):
+        group_candidates = build_group_candidates_multitask(dataset, normalizers, device)
+
+    max_batches = int(cfg["training"].get("val_max_batches", 0))
+    n_total = len(dataset)
+    n_evaluated = n_total if max_batches <= 0 else min(n_total, max_batches * args.batch_size)
+    truncated = n_evaluated < n_total
+    print(f"评测 {n_evaluated}/{n_total} 条（val_max_batches={max_batches}, "
+          f"batch={args.batch_size}）(latent_ar, per-task-type)")
+    if truncated:
+        print(f"[WARNING] 评测被截断：仅评 {n_evaluated}/{n_total} 条 "
+              f"(val_max_batches={max_batches})。传 --val-max-batches 0 可评全量。")
+
+    metrics = validate_multitask(
+        model, loader, cfg, rank=0, distributed=False,
+        normalizers=normalizers, group_candidates=group_candidates,
+    )
+    metrics["n_evaluated"] = int(n_evaluated)
+    metrics["n_total"] = int(n_total)
+    metrics["truncated"] = bool(truncated)
+    metrics["val_max_batches"] = int(max_batches)
+    return metrics
+
+
+def evaluate_legacy(
+    model: DexVLG,
+    cfg: dict,
+    args: argparse.Namespace,
+    num_steps: int,
+) -> tuple[dict, list]:
+    """Legacy bimanual evaluation (fixed left+right), unchanged behavior."""
+    data_cfg = cfg["data"]
+    dataset = build_test_dataset(cfg, multi_task=False)
+    loader = torch.utils.data.DataLoader(
+        dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=cfg["training"].get("num_workers", 4),
         collate_fn=collate_fn,
         pin_memory=True,
     )
-
     normalizers = build_hand_normalizers(
         data_cfg.get("normalization", None), joint_dim=cfg["model"].get("joint_dim", 22)
     )
+    print(f"Evaluating on {len(dataset)} samples with {num_steps} ODE steps...")
+    return evaluate(model, loader, num_steps, args.save_predictions, normalizers)
 
-    print(f"Evaluating on {len(test_dataset)} samples with {args.num_steps} ODE steps...")
-    metrics, predictions = evaluate(
-        model, test_loader, args.num_steps, args.save_predictions, normalizers,
-    )
 
-    print("\n" + "=" * 60)
-    print("Evaluation Results")
-    print("=" * 60)
-    for k, v in sorted(metrics.items()):
-        print(f"  {k}: {v:.4f}")
-    print("=" * 60)
+def main():
+    args = parse_args()
+    with open(args.config, "r") as f:
+        cfg = yaml.safe_load(f)
+    set_seed(cfg["training"].get("seed", 42))
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_name)
+
+    num_steps = args.num_steps
+    if num_steps is None:
+        num_steps = int(cfg.get("inference", {}).get("num_steps", 50))
+    cfg.setdefault("inference", {})["num_steps"] = num_steps
+    if args.val_max_batches >= 0:
+        cfg["training"]["val_max_batches"] = args.val_max_batches
+
+    print("Loading model...")
+    model = DexVLG(cfg["model"]).to(device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    use_ema = args.use_ema and "ema_state_dict" in ckpt
+    sd = ckpt["ema_state_dict"] if use_ema else ckpt["model_state_dict"]
+    if "ema_state_dict" in ckpt and not args.use_ema:
+        print("[WARNING] 该 ckpt 验证分数来自 EMA 权重，当前加载 raw "
+              "model_state_dict；如需与验证分数对齐请加 --use-ema。")
+    elif args.use_ema and "ema_state_dict" not in ckpt:
+        print("[WARNING] --use-ema 已指定但 ckpt 无 ema_state_dict，回退加载 raw 权重。")
+    model.load_state_dict(sd)
+    print(f"Loaded checkpoint from epoch {ckpt.get('epoch', '?')} "
+          f"(weights={'ema' if use_ema else 'raw'})")
+
+    architecture = str(cfg["model"].get("architecture", "legacy_bimanual"))
+    predictions: list = []
+    if architecture == "latent_ar":
+        metrics = evaluate_latent_ar(model, cfg, args, device)
+        print("\n" + "=" * 60)
+        print(f"Evaluation Results (latent_ar)  score={metrics['score']:.4f}")
+        print("=" * 60)
+        print("macro:", {k: round(v, 4) for k, v in metrics["macro"].items()})
+        print("bimanual:", {k: round(v, 4) for k, v in metrics["bimanual"].items()})
+        for line in format_multitask_val_table(metrics["per_task"]):
+            print(line)
+        print("=" * 60)
+    else:
+        metrics, predictions = evaluate_legacy(model, cfg, args, num_steps)
+        print("\n" + "=" * 60)
+        print("Evaluation Results")
+        print("=" * 60)
+        for k, v in sorted(metrics.items()):
+            print(f"  {k}: {v:.4f}")
+        print("=" * 60)
 
     with open(os.path.join(args.output_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)

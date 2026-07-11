@@ -30,3 +30,7 @@ venv/
 
 pretrained_models/
 .setup_logs/
+local_data/
+
+outputs*/
+metric_eval/results/

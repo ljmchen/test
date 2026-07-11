@@ -4,7 +4,8 @@ Trains the full model end-to-end: PC encoder, projector, fusion transformer,
 and flow-matching head, using conditional flow matching loss.
 
 Usage:
-    python train.py --config configs/default.yaml [--resume PATH]
+    python train.py --config configs/v3_multitask.yaml [--resume PATH]
+    (argparse 默认 configs/v3_smoke.yaml —— smoke 规模，裸跑安全)
 """
 
 import argparse
@@ -23,12 +24,37 @@ from torch.utils.tensorboard import SummaryWriter
 import yaml
 from tqdm import tqdm
 
-from data.dataset import create_dataloader, DexGraspDataset, collate_fn, group_id_of
+from data.dataset import (
+    create_dataloader,
+    DexGraspDataset,
+    collate_fn,
+    group_id_of,
+    hands_present,
+)
 from data.pose_normalizer import build_hand_normalizers
 from data.samplers import GroupedEpochSampler
 from models.dexvlg import DexVLG
+from utils.metrics import (
+    BIMANUAL,
+    MultiTaskValAccumulator,
+    TASK_TYPES,
+    align_hands_by_side,
+    compose_score,
+    pose_errors_physical,
+    relative_pose_error,
+    structure_metrics,
+    task_type_index,
+)
 from utils.rotation import rotation_6d_to_matrix
 from utils.misc import set_seed, count_parameters, AverageMeter
+
+_TRAIN_LOSS_COMPONENT_KEYS = (
+    "loss_flow",
+    "loss_presence",
+    "loss_side",
+    "loss_probe_task",
+    "loss_probe_lobj",
+)
 
 
 def geodesic_angle(pred_rot6d: torch.Tensor, gt_rot6d: torch.Tensor) -> torch.Tensor:
@@ -68,7 +94,7 @@ class _EMA:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train DexVLG model")
-    parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser.add_argument("--config", type=str, default="configs/v3_smoke.yaml")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--output_dir", type=str, default=None)
@@ -183,6 +209,8 @@ def train_one_epoch(
     amp_enabled, amp_dtype, _ = get_amp_settings(cfg["training"])
     grad_clip = cfg["training"].get("grad_clip", 1.0)
     log_interval = cfg["training"].get("log_interval", 50)
+    multi_task = bool(cfg["data"].get("multi_task", False))
+    architecture = str(cfg["model"].get("architecture", "legacy_bimanual"))
     nonfinite_skips = 0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=rank != 0)
@@ -192,14 +220,37 @@ def train_one_epoch(
         gt_poses = batch["gt_poses"].cuda(non_blocking=True)
         texts = batch["texts"]
 
+        extra_inputs: dict = {}
+        if multi_task:
+            hand_mask = batch["hand_mask"].cuda(non_blocking=True)
+            hand_side_ids = batch["hand_side_ids"].cuda(non_blocking=True)
+            l_obj = batch["L_obj"].cuda(non_blocking=True)
+            if architecture == "latent_ar":
+                extra_inputs = {
+                    "hand_mask": hand_mask,
+                    "hand_side_ids": hand_side_ids,
+                    "task_type_ids": task_type_index(
+                        batch["task_types"], device=xyz.device
+                    ),
+                    "log_l_obj": l_obj.log(),
+                }
+
         optimizer.zero_grad(set_to_none=True)
 
         with autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
-            outputs = model(xyz, rgb, texts, gt_poses=gt_poses)
+            outputs = model(xyz, rgb, texts, gt_poses=gt_poses, **extra_inputs)
             loss = outputs["loss"]
 
         # Skip the step on a non-finite loss instead of stepping into NaN weights.
-        if not torch.isfinite(loss):
+        # The skip decision must be synchronized across ranks: if one rank skips
+        # backward while others enter the gradient all-reduce, the DDP buckets
+        # pair across iterations (silent gradient corruption, then hang/crash).
+        nonfinite_flag = (~torch.isfinite(loss.detach())).to(
+            device=loss.device, dtype=torch.float32
+        )
+        if dist.is_initialized():
+            dist.all_reduce(nonfinite_flag, op=dist.ReduceOp.MAX)
+        if bool(nonfinite_flag.item()):
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             global_step += 1
@@ -228,12 +279,24 @@ def train_one_epoch(
             pbar.set_postfix(loss=f"{loss_val:.4f}", avg=f"{loss_meter.avg:.4f}")
             if global_step % log_interval == 0:
                 lr = scheduler.get_last_lr()[0]
+                components = {
+                    key: outputs[key].item()
+                    for key in _TRAIN_LOSS_COMPONENT_KEYS
+                    if key in outputs
+                }
                 if writer:
                     writer.add_scalar("train/loss", loss_val, global_step)
                     writer.add_scalar("train/lr", lr, global_step)
+                    for key, value in components.items():
+                        writer.add_scalar(f"train/{key}", value, global_step)
+                parts = "".join(
+                    f" {key.removeprefix('loss_')}={value:.4f}"
+                    for key, value in components.items()
+                )
                 logger.info(
                     f"[epoch {epoch} step {global_step}] "
                     f"train_loss={loss_val:.4f} avg={loss_meter.avg:.4f} lr={lr:.2e}"
+                    f"{parts}"
                 )
 
     return loss_meter.avg, global_step
@@ -243,27 +306,42 @@ def run_validation(vc: dict, epoch: int, global_step: int) -> None:
     """Run sampling-based validation, log it, and update best-K checkpoints.
 
     Collective: every rank must call this together. Only rank 0 logs/saves.
+    Dispatches to the multi-task latent_ar validator when ``data.multi_task``
+    is set; the legacy bimanual path is unchanged otherwise.
     """
     model = vc["model"]
+    cfg = vc["cfg"]
     ema = vc.get("ema")
     val_model = ema.shadow if ema is not None else model
+    multi_task = bool(cfg["data"].get("multi_task", False))
     # Build (once, cached) the group->GT-candidates map for group-internal matching.
     group_candidates = None
-    if bool(vc["cfg"]["training"].get("val_group_min", False)) and vc["val_loader"] is not None:
+    if bool(cfg["training"].get("val_group_min", False)) and vc["val_loader"] is not None:
         if vc.get("group_candidates") is None:
-            vc["group_candidates"] = build_group_candidates(
-                vc["val_loader"].dataset, vc.get("normalizers"), torch.device("cuda")
-            )
+            if multi_task:
+                vc["group_candidates"] = build_group_candidates_multitask(
+                    vc["val_loader"].dataset, vc.get("normalizers"), torch.device("cuda")
+                )
+            else:
+                vc["group_candidates"] = build_group_candidates(
+                    vc["val_loader"].dataset, vc.get("normalizers"), torch.device("cuda")
+                )
             if vc["rank"] == 0:
                 vc["logger"].info(
                     f"Built val group candidates: {len(vc['group_candidates'])} groups "
                     "(group-internal best-match validation ON)"
                 )
         group_candidates = vc["group_candidates"]
-    val_metrics = validate(
-        val_model, vc["val_loader"], vc["cfg"], vc["rank"], vc["distributed"],
-        normalizers=vc.get("normalizers"), group_candidates=group_candidates,
-    )
+    if multi_task:
+        val_metrics = validate_multitask(
+            val_model, vc["val_loader"], cfg, vc["rank"], vc["distributed"],
+            normalizers=vc.get("normalizers"), group_candidates=group_candidates,
+        )
+    else:
+        val_metrics = validate(
+            val_model, vc["val_loader"], cfg, vc["rank"], vc["distributed"],
+            normalizers=vc.get("normalizers"), group_candidates=group_candidates,
+        )
     model.train()  # restore training mode on every rank before continuing
 
     if vc["rank"] != 0:
@@ -275,6 +353,21 @@ def run_validation(vc: dict, epoch: int, global_step: int) -> None:
         writer.add_scalar("val/rot_err_rad", val_metrics["rot"], global_step)
         writer.add_scalar("val/joint_err_rad", val_metrics["joint"], global_step)
         writer.add_scalar("val/score", val_metrics["score"], global_step)
+        if "per_task" in val_metrics:
+            for tt, m in val_metrics["per_task"].items():
+                for key in (
+                    "trans", "rot", "joint",
+                    "count_acc", "side_acc", "structure_acc",
+                ):
+                    if math.isfinite(m[key]):
+                        writer.add_scalar(f"val/{tt}/{key}", m[key], global_step)
+            for key, value in val_metrics["bimanual"].items():
+                if math.isfinite(value):
+                    writer.add_scalar(f"val/bimanual/{key}", value, global_step)
+
+    if "per_task" in val_metrics:
+        for line in format_multitask_val_table(val_metrics["per_task"]):
+            logger.info(line)
 
     score = val_metrics["score"]
     vc["best_registry"], kept = update_best_checkpoints(
@@ -480,6 +573,323 @@ def validate(
     return {"trans": trans, "rot": rot, "joint": joint, "score": trans + rot + joint}
 
 
+def denormalize_hand_slots(
+    poses: torch.Tensor,
+    sides: torch.Tensor,
+    mask: torch.Tensor,
+    l_obj: torch.Tensor,
+    normalizers: dict | None,
+) -> torch.Tensor:
+    """Denormalize per-slot hand poses, picking the normalizer by hand side.
+
+    Args:
+        poses: Normalized poses, shape (B, 2, pose_dim); pad slots are zero.
+        sides: Hand side ids per slot (0=left, 1=right, -1=pad), shape (B, 2).
+        mask: Slot validity, shape (B, 2) bool.
+        l_obj: Per-sample object characteristic length, shape (B,).
+        normalizers: ``{"left", "right"}`` pose normalizers, or None when
+            normalization is disabled (poses are already physical).
+
+    Returns:
+        Poses in physical units, shape (B, 2, pose_dim); pad slots stay zero.
+    """
+    out = poses.float().clone()
+    if normalizers is None:
+        return out
+    mask = mask.bool()
+    for side_id, name in ((0, "left"), (1, "right")):
+        for s in range(poses.shape[1]):
+            sel = mask[:, s] & (sides[:, s] == side_id)
+            if bool(sel.any()):
+                out[sel, s] = normalizers[name].denormalize_pose(
+                    poses[sel, s].float(), L_obj=l_obj[sel]
+                )
+    return out
+
+
+@torch.no_grad()
+def build_group_candidates_multitask(dataset, normalizers: dict | None, device) -> dict:
+    """Collect each group's GT grasps bucketed by hand-set signature.
+
+    A signature is the tuple of sorted hand side ids present in a record
+    (``(0,)`` left-only, ``(1,)`` right-only, ``(0, 1)`` bimanual), so
+    predictions are only matched against candidates with the same hand set.
+
+    Args:
+        dataset: Multi-task ``DexGraspDataset`` (val split).
+        normalizers: Per-hand pose normalizers or None.
+        device: Device for the candidate tensors.
+
+    Returns:
+        ``{group_id: {signature: (K, H, pose_dim) tensor}}`` in physical
+        units, with the H hands in ascending side-id (canonical) order.
+    """
+    from collections import defaultdict
+
+    buckets: dict[str, dict[tuple, list]] = defaultdict(lambda: defaultdict(list))
+    for idx, record in enumerate(dataset.data):
+        sides = hands_present(record)
+        if not sides:
+            raise ValueError(
+                f"Val record idx={idx} obj_id={record.get('obj_id')!r} has no "
+                "dex_grasp_left/right; cannot build group candidates."
+            )
+        l_obj = dataset._object_scale_length(record)
+        poses = []
+        for side in sides:
+            pose = dataset._build_hand_pose(record, side, l_obj)
+            if normalizers is not None:
+                pose = normalizers[side].denormalize_pose(pose, L_obj=l_obj)
+            poses.append(pose)
+        sig = tuple(0 if side == "left" else 1 for side in sides)
+        buckets[group_id_of(record)][sig].append(torch.stack(poses))
+    return {
+        gid: {
+            sig: torch.stack(cands).float().to(device)
+            for sig, cands in sig_buckets.items()
+        }
+        for gid, sig_buckets in buckets.items()
+    }
+
+
+def _accumulate_group_min(
+    acc: MultiTaskValAccumulator,
+    group_candidates: dict,
+    group_ids: list[str],
+    tt_ids: torch.Tensor,
+    pred_real: torch.Tensor,
+    pred_mask: torch.Tensor,
+    pred_sides: torch.Tensor,
+    trans_dim: int,
+    rot_dim: int,
+) -> None:
+    """Accumulate group-internal best-match pose errors per sample.
+
+    Candidates are looked up by (group_id, hand-set signature); the candidate
+    minimizing the summed per-hand (trans + rot + joint) error is scored.
+    Predictions whose signature has no candidate are counted as structure
+    misses and excluded from the pose means.
+    """
+    for b in range(pred_real.shape[0]):
+        slots = pred_mask[b].nonzero(as_tuple=True)[0]
+        order = torch.argsort(pred_sides[b, slots])
+        slots = slots[order]
+        sig = tuple(int(s) for s in pred_sides[b, slots].tolist())
+        sig_buckets = group_candidates.get(group_ids[b])
+        cands = None if sig_buckets is None else sig_buckets.get(sig)
+        if cands is None or len(sig) == 0:
+            acc.add_structure_miss(int(tt_ids[b]))
+            continue
+        pred_h = pred_real[b, slots]
+        trans, rot, joint = pose_errors_physical(
+            pred_h.unsqueeze(0), cands, trans_dim, rot_dim
+        )
+        best = (trans + rot + joint).sum(dim=-1).argmin()
+        acc.add_pose_sample(int(tt_ids[b]), trans[best], rot[best], joint[best])
+
+
+@torch.no_grad()
+def validate_multitask(
+    model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    cfg: dict,
+    rank: int,
+    distributed: bool = False,
+    normalizers: dict | None = None,
+    group_candidates: dict | None = None,
+) -> dict:
+    """Multi-task validation for the latent_ar architecture.
+
+    Two rollouts per batch keep decision and pose quality unpolluted:
+
+      - **decision metrics** (hand_count/side/structure accuracy) come from a
+        free rollout (no forcing), optionally capped to the first
+        ``training.val_decision_max_batches`` batches (0 = all);
+      - **pose metrics** (translation m / rotation rad / joint rad) come from a
+        forced-decision rollout (``force_sides``/``force_mask`` = GT), each
+        slot denormalized with its own hand-side normalizer and per-sample
+        ``L_obj``, then side-aligned against GT. With ``group_candidates``
+        the errors are the argmin over same-signature GT candidates of the
+        sample's group.
+      - **bimanual relative errors** (rel_trans/rel_rot) compare the two-hand
+        relative pose against the sample's own GT record.
+
+    All statistics accumulate into one fixed-layout tensor and are reduced
+    with a single all_reduce (never a dict reduction).
+
+    Returns:
+        Dict with ``score`` (compose_score; lower is better), ``per_task``,
+        ``macro``, ``bimanual``, and macro ``trans``/``rot``/``joint``.
+    """
+    model.eval()
+    net = model.module if hasattr(model, "module") else model
+    if net.architecture != "latent_ar":
+        raise ValueError(
+            "validate_multitask requires model.architecture 'latent_ar'; "
+            f"got '{net.architecture}'."
+        )
+    device = next(net.parameters()).device
+    amp_enabled, amp_dtype, _ = get_amp_settings(cfg["training"])
+    amp_enabled = amp_enabled and device.type == "cuda"
+    infer_cfg = cfg.get("inference", {}) or {}
+    num_steps = int(infer_cfg.get("num_steps", 10))
+    presence_threshold = float(infer_cfg.get("presence_threshold", 0.5))
+    max_batches = int(cfg["training"].get("val_max_batches", 0))
+    decision_max_batches = int(cfg["training"].get("val_decision_max_batches", 0))
+    trans_dim, rot_dim = net.trans_dim, net.rot_dim
+
+    acc = MultiTaskValAccumulator(device=device)
+
+    for batch_idx, batch in enumerate(
+        tqdm(dataloader, desc="Validation", disable=rank != 0)
+    ):
+        if max_batches > 0 and batch_idx >= max_batches:
+            break
+        xyz = batch["xyz"].to(device, non_blocking=True)
+        rgb = batch["rgb"].to(device, non_blocking=True)
+        gt_poses = batch["gt_poses"].to(device, non_blocking=True)
+        hand_mask = batch["hand_mask"].to(device, non_blocking=True)
+        hand_side_ids = batch["hand_side_ids"].to(device, non_blocking=True)
+        l_obj = batch["L_obj"].to(device, non_blocking=True)
+        texts = batch["texts"]
+        tt_ids = task_type_index(batch["task_types"], device=device)
+
+        run_decision = decision_max_batches <= 0 or batch_idx < decision_max_batches
+        with autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
+            if run_decision:
+                free = net.sample_latent_ar(
+                    xyz, rgb, texts,
+                    num_steps=num_steps, presence_threshold=presence_threshold,
+                )
+            forced = net.sample_latent_ar(
+                xyz, rgb, texts,
+                num_steps=num_steps, presence_threshold=presence_threshold,
+                force_sides=hand_side_ids, force_mask=hand_mask,
+            )
+
+        if run_decision:
+            count_ok, side_ok, struct_ok = structure_metrics(
+                free["hand_mask"], free["hand_sides"], hand_mask, hand_side_ids
+            )
+            acc.add_decision(tt_ids, count_ok, side_ok, struct_ok, hand_mask.sum(dim=1))
+
+        pred_real = denormalize_hand_slots(
+            forced["poses"], forced["hand_sides"], forced["hand_mask"], l_obj, normalizers
+        )
+        gt_real = denormalize_hand_slots(
+            gt_poses, hand_side_ids, hand_mask, l_obj, normalizers
+        )
+        aligned_pred, matched, _ = align_hands_by_side(
+            pred_real, forced["hand_mask"], forced["hand_sides"],
+            gt_real, hand_mask, hand_side_ids,
+        )
+
+        if group_candidates is None:
+            trans, rot, joint = pose_errors_physical(
+                aligned_pred, gt_real, trans_dim, rot_dim
+            )
+            acc.add_pose_errors(tt_ids, trans, rot, joint, matched)
+        else:
+            _accumulate_group_min(
+                acc, group_candidates, batch["group_ids"], tt_ids,
+                pred_real, forced["hand_mask"], forced["hand_sides"],
+                trans_dim, rot_dim,
+            )
+
+        pair_ok = matched.all(dim=1) & (hand_mask.sum(dim=1) == 2)
+        if bool(pair_ok.any()):
+            rel_trans, rel_rot = relative_pose_error(
+                aligned_pred[pair_ok], gt_real[pair_ok], trans_dim, rot_dim
+            )
+            acc.add_relative(tt_ids[pair_ok], rel_trans, rel_rot)
+
+    acc.all_reduce(distributed)
+    summary = acc.summary()
+    per_task = summary["per_task"]
+
+    per_tt_errors = {
+        tt: {k: m[k] for k in ("trans", "rot", "joint")}
+        for tt, m in per_task.items()
+        if m["n_hand"] > 0
+    }
+    structure_acc = {
+        tt: m["structure_acc"] for tt, m in per_task.items() if m["n_decision"] > 0
+    }
+    rel_errors = {
+        tt: {"rel_trans": m["rel_trans"], "rel_rot": m["rel_rot"]}
+        for tt, m in per_task.items()
+        if tt in BIMANUAL and m["n_rel"] > 0
+    }
+    score = compose_score(
+        per_tt_errors,
+        structure_acc,
+        rel_errors,
+        cfg["training"].get("val_score_weights", None),
+        reduce=str(cfg["training"].get("val_score_reduce", "macro")),
+    )
+    return {
+        "score": score,
+        "per_task": per_task,
+        "macro": summary["macro"],
+        "bimanual": summary["bimanual"],
+        "trans": summary["macro"]["trans"],
+        "rot": summary["macro"]["rot"],
+        "joint": summary["macro"]["joint"],
+    }
+
+
+def format_multitask_val_table(per_task: dict) -> list[str]:
+    """Render the per-task-type validation table as log lines.
+
+    Args:
+        per_task: ``validate_multitask``'s per-task summary.
+
+    Returns:
+        List of aligned text lines (header + one row per task type).
+    """
+
+    def fmt(value: float, width: int = 7, prec: int = 4) -> str:
+        if math.isfinite(value):
+            return f"{value:{width}.{prec}f}"
+        return " " * (width - 1) + "-"
+
+    lines = [
+        "  task_type  n_hand   trans     rot   joint | n_dec cnt_acc sid_acc str_acc"
+        " | n_rel   rel_t   rel_r | miss"
+    ]
+    for tt in TASK_TYPES:
+        m = per_task[tt]
+        lines.append(
+            f"  {tt:<9}  {m['n_hand']:>6} {fmt(m['trans'])} {fmt(m['rot'])}"
+            f" {fmt(m['joint'])} | {m['n_decision']:>5} {fmt(m['count_acc'])}"
+            f" {fmt(m['side_acc'])} {fmt(m['structure_acc'])} | {m['n_rel']:>5}"
+            f" {fmt(m['rel_trans'])} {fmt(m['rel_rot'])} | {m['n_struct_miss']:>4}"
+        )
+    return lines
+
+
+def scenario_composition(
+    sampler: GroupedEpochSampler, records: list[dict]
+) -> dict[str, int]:
+    """Count per-task_type record draws in the sampler's current epoch shard.
+
+    Re-iterating the sampler is deterministic for a fixed epoch, so this does
+    not disturb the subsequent DataLoader iteration.
+
+    Args:
+        sampler: The epoch sampler after ``set_epoch``.
+        records: The dataset's raw records.
+
+    Returns:
+        ``{task_type: count}`` sorted by task type.
+    """
+    counts: dict[str, int] = {}
+    for idx in iter(sampler):
+        tt = str(records[idx].get("task_type", ""))
+        counts[tt] = counts.get(tt, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -502,10 +912,18 @@ def save_checkpoint(
         "scaler_state_dict": scaler.state_dict(),
         "val_loss": val_loss,
         "val_metrics": val_metrics or {},
+        # Which weights produced the validation score: with EMA on, validation
+        # runs the EMA shadow, so consumers should load ema_state_dict
+        # (--use-ema) to match the score.
+        "val_weights": "ema" if ema is not None else "raw",
     }
     if ema is not None:
         ckpt["ema_state_dict"] = ema.state_dict()
-    torch.save(ckpt, path)
+    # Atomic write: crash/kill mid-save must not leave a truncated checkpoint
+    # at `path` (os.replace is atomic within the same directory/filesystem).
+    tmp_path = path + ".tmp"
+    torch.save(ckpt, tmp_path)
+    os.replace(tmp_path, path)
 
 
 _BEST_CKPT_RE = re.compile(r"best_e\d+_s([0-9]+\.[0-9]+)\.pt$")
@@ -565,7 +983,20 @@ def main():
     distributed = dist.is_initialized()
 
     train_cfg = cfg["training"]
-    set_seed(train_cfg.get("seed", 42))
+    # Rank-offset so per-step RNG draws (flow t/noise, hand-cond noise, dropout,
+    # CFG drop) differ across ranks; the samplers run their own base_seed-driven
+    # generators so sharding stays rank-consistent, and DDP broadcasts rank-0
+    # weights at wrap time so init still matches.
+    set_seed(int(train_cfg.get("seed", 42)) + rank)
+
+    multi_task = bool(cfg["data"].get("multi_task", False))
+    architecture = str(cfg["model"].get("architecture", "legacy_bimanual"))
+    if multi_task and architecture != "latent_ar":
+        raise ValueError(
+            "data.multi_task: true requires model.architecture: latent_ar; "
+            f"got '{architecture}'. The legacy bimanual path only supports "
+            "multi_task: false."
+        )
 
     output_dir = args.output_dir or cfg["paths"]["output_dir"]
     ckpt_dir = os.path.join(output_dir, cfg["paths"]["checkpoint_dir"])
@@ -616,6 +1047,7 @@ def main():
         center_on_object=data_cfg.get("center_on_object", True),
         obj_pose_quaternion_order=data_cfg.get("obj_pose_quaternion_order", "wxyz"),
         normalization=data_cfg.get("normalization", None),
+        multi_task=multi_task,
     )
     train_dataset = DexGraspDataset(
         data_path=data_cfg["train_data"],
@@ -632,7 +1064,7 @@ def main():
     loader_kwargs: dict = {}
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = train_cfg.get("persistent_workers", True)
-        loader_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 4)
+        loader_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 2)
 
     # Optional per-epoch grouped resampling: each epoch draw N grasps per
     # (obj_id, pose_id, guidance) combo instead of using every record. Keeps the
@@ -642,17 +1074,27 @@ def main():
     use_epoch_sampling = bool(es_cfg.get("enabled", False))
     group_keys = es_cfg.get("group_keys", ["obj_id", "pose_id", "guidance"])
     seed = train_cfg.get("seed", 42)
+    scenario_key = es_cfg.get("scenario_key")
     if rank == 0 and use_epoch_sampling:
         logger.info(
             f"Epoch sampling ON: {es_cfg.get('samples_per_group', 4)} per "
             f"{'+'.join(group_keys)} combo (train), "
             f"{es_cfg.get('val_samples_per_group', es_cfg.get('samples_per_group', 4))} (val)."
         )
+        if scenario_key:
+            logger.info(
+                f"Scenario balancing ON: key={scenario_key} "
+                f"shares={es_cfg.get('scenario_shares')} "
+                f"epoch_size={es_cfg.get('epoch_size')}"
+            )
 
     if use_epoch_sampling:
         train_sampler = GroupedEpochSampler(
             train_dataset.data, group_keys, int(es_cfg.get("samples_per_group", 4)),
             shuffle=True, num_replicas=world_size, rank=rank, base_seed=seed, drop_last=True,
+            scenario_key=scenario_key,
+            scenario_shares=es_cfg.get("scenario_shares"),
+            epoch_size=es_cfg.get("epoch_size"),
         )
     else:
         train_sampler = DistributedSampler(train_dataset) if distributed else None
@@ -680,13 +1122,28 @@ def main():
         )
         if use_epoch_sampling:
             # Fixed (epoch 0) grouped subset for a stable, comparable val metric.
+            # multi_task shuffles the (still epoch-fixed, deterministic) order so
+            # a val_max_batches cap sees a mix of task types, not one data-order
+            # contiguous scenario.
             val_per_group = int(es_cfg.get("val_samples_per_group", es_cfg.get("samples_per_group", 4)))
             val_sampler = GroupedEpochSampler(
-                val_dataset.data, group_keys, val_per_group, shuffle=False,
+                val_dataset.data, group_keys, val_per_group, shuffle=multi_task,
                 num_replicas=world_size, rank=rank, base_seed=seed, drop_last=False,
             )
         else:
-            val_sampler = DistributedSampler(val_dataset, shuffle=False) if distributed else None
+            if multi_task:
+                # Same rationale as above: the fuse splits are contiguous
+                # task_type blocks, so a val_max_batches cap over sequential
+                # order would validate a single scenario. Fixed permutation
+                # (no set_epoch / epoch-0 shuffle) keeps the metric stable.
+                if distributed:
+                    val_sampler = DistributedSampler(val_dataset, shuffle=True, seed=int(seed))
+                else:
+                    val_gen = torch.Generator()
+                    val_gen.manual_seed(int(seed))
+                    val_sampler = torch.randperm(len(val_dataset), generator=val_gen).tolist()
+            else:
+                val_sampler = DistributedSampler(val_dataset, shuffle=False) if distributed else None
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=train_cfg["batch_size"],
@@ -717,8 +1174,25 @@ def main():
     start_epoch = 0
     global_step = 0
     keep_best_k = train_cfg.get("keep_best_k", 4)
+    # Rolling latest checkpoint (last.pt) is saved every epoch; a numbered
+    # snapshot (epoch_XXXX.pt) is kept every `save_interval` epochs (0 disables).
+    save_interval = int(train_cfg.get("save_interval", 20))
     # registry of (score, path) for the best checkpoints kept on disk (rank 0).
-    best_registry = scan_best_checkpoints(ckpt_dir) if rank == 0 else []
+    # Only inherited on --resume: a fresh run must not adopt a previous run's
+    # best_*.pt (their scores are not comparable and inherited entries would be
+    # evicted/DELETED by this run's top-K bookkeeping).
+    best_registry = scan_best_checkpoints(ckpt_dir) if (rank == 0 and args.resume) else []
+    if rank == 0 and not args.resume:
+        stale_best = scan_best_checkpoints(ckpt_dir)
+        if stale_best:
+            logger.warning(
+                "!" * 70 + "\n"
+                f"ckpt_dir 已存在 {len(stale_best)} 个旧 run 的 best_*.pt（未 --resume，"
+                "本次 fresh run 不继承其注册表）：旧 best 文件会与新 run 的 best 混在同一目录，"
+                "同名冲突时可能被覆盖；建议先清理/移走旧 best，或改用 --resume。\n"
+                + "\n".join(f"  {p} (score={s:.4f})" for s, p in stale_best) + "\n"
+                + "!" * 70
+            )
     best_score = best_registry[0][0] if best_registry else float("inf")
 
     if args.resume:
@@ -728,8 +1202,14 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         scaler.load_state_dict(ckpt["scaler_state_dict"])
-        if ema is not None and "ema_state_dict" in ckpt:
-            ema.load_state_dict(ckpt["ema_state_dict"])
+        if ema is not None:
+            if "ema_state_dict" in ckpt:
+                ema.load_state_dict(ckpt["ema_state_dict"])
+            else:
+                # The shadow was deep-copied from the pre-resume (random-init)
+                # model; rebuild from the loaded weights or every validation
+                # would score a near-random shadow.
+                ema = _EMA(base_model, decay=ema.decay)
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt["global_step"]
         if rank == 0:
@@ -784,6 +1264,11 @@ def main():
         # (DistributedSampler also needs this for correct cross-epoch shuffling).
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
+        if rank == 0 and multi_task and isinstance(train_sampler, GroupedEpochSampler):
+            logger.info(
+                f"[epoch {epoch}] train scenario composition (rank-0 shard): "
+                f"{scenario_composition(train_sampler, train_dataset.data)}"
+            )
 
         train_loss, global_step = train_one_epoch(vc, train_loader, epoch, global_step)
 
@@ -802,6 +1287,25 @@ def main():
         ):
             run_validation(vc, epoch, global_step)
             validated_last_epoch = epoch == last_epoch
+
+        # Rolling latest checkpoint every epoch so an interrupted run can always
+        # resume from the newest state; plus a numbered snapshot every
+        # `save_interval` epochs. Runs after validation so best_registry (hence
+        # the recorded best score) is current.
+        if rank == 0:
+            cur_best = vc["best_registry"][0][0] if vc["best_registry"] else float("inf")
+            save_checkpoint(
+                model, optimizer, scheduler, scaler,
+                epoch, global_step, cur_best,
+                os.path.join(ckpt_dir, "last.pt"), ema=ema,
+            )
+            if save_interval > 0 and (epoch + 1) % save_interval == 0:
+                snap_path = os.path.join(ckpt_dir, f"epoch_{epoch:04d}.pt")
+                save_checkpoint(
+                    model, optimizer, scheduler, scaler,
+                    epoch, global_step, cur_best, snap_path, ema=ema,
+                )
+                logger.info(f"[epoch {epoch}] saved periodic checkpoint {os.path.basename(snap_path)}")
 
     # Final validation so the last state can enter top-K, unless already done.
     if val_loader is not None and not validated_last_epoch:

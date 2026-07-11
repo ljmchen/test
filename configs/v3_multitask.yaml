@@ -1,0 +1,201 @@
+# DexVLG v3 multi-task configuration (latent_ar architecture).
+# Trains the autoregressive latent-thinking model on the unified v3 splits
+# (task_type: left | right | lgbidex | bidex) with variable hand counts.
+# Data: fuse_v2 unified splits (train 1,180,992 / test 273,776 records).
+# Launch (always under tmux, idle GPU, outputs/test_v2data):
+#   tmux new -d -s v3train
+#   tmux send-keys -t v3train 'CUDA_VISIBLE_DEVICES=<idle> \
+#     /mnt/conda/jiaxuan/miniconda3/envs/dexvlg/bin/python train.py \
+#     --config configs/v3_multitask.yaml' Enter
+
+# ─── Model ────────────────────────────────────────────────────────────
+model:
+  # legacy_bimanual (default, old checkpoints) | latent_ar (this config).
+  # latent_ar is NOT checkpoint-compatible with legacy runs; train from scratch.
+  architecture: latent_ar
+
+  # Point cloud encoder (PointNet++)
+  pc_in_channels: 3          # xyz-only
+  pc_feature_dim: 256
+  num_pc_tokens: 64
+
+  # Language model
+  language_backbone: modernbert
+  bert_model: "pretrained_models/ModernBERT-base"
+  bert_dim: 768               # must equal the encoder hidden_size
+  freeze_bert_embeddings: false
+  # Tokenizer padding: max_length = fixed 128 tokens (batch-invariant
+  # inference); longest = pad to the longest text in the batch (legacy,
+  # predictions drift with batch composition).
+  lang_padding: max_length
+  # Mask language pad tokens in ALL downstream cross-attention (flow +
+  # reasoner). 改此项需重训：旧 ckpt 在 pad 可见分布下训练，直接开启会分布错配。
+  # 生效于下一轮从零训练的 run。
+  mask_pad_tokens: true
+
+  # Fusion transformer
+  fusion_depth: 4
+
+  # Flow-Matching Transformer (one call per hand under latent_ar)
+  flow_hidden_dim: 256
+  flow_depth: 6
+  flow_heads: 8
+
+  joint_dim: 22               # Shadow Hand DOF
+
+  # Per-element flow-loss weights (joints otherwise dominate the MSE).
+  flow_loss_component_weights:
+    translation: 3.0
+    rotation: 6.0
+    joint: 1.0
+
+  # Autoregressive latent reasoner (Coconut-style thinking + per-hand steps).
+  reasoner:
+    dim: 512
+    depth: 4
+    num_heads: 8
+    num_thinking_tokens: 6
+    max_hands: 2
+    feedback_norm: true
+    mlp_ratio: 4.0
+    # std of the noise added to the teacher-forced hand-0 GT pose that
+    # conditions hand step 1 (normalized units; mitigates exposure bias).
+    hand_cond_noise_std: 0.1
+    # Optional auxiliary probe (task_type CE + log L_obj regression) on the
+    # pooled thinking tokens; off for the baseline.
+    aux_probe:
+      enabled: false
+      hidden_dim: 256
+      num_task_types: 4
+
+  # Total-loss weights for the latent_ar objective.
+  loss_weights:
+    flow: 1.0
+    presence: 0.5
+    side: 0.5
+    probe: 0.1
+
+  # Under latent_ar the hand-type embedding is indexed by hand SIDE semantics
+  # (hand_ids). cross_hand_attn must stay off: hand-2 conditioning happens via
+  # the previous-hand token in the flow cross-attention memory instead.
+  hand_interaction:
+    enabled: true
+    cross_hand_attn: false
+
+  # Classifier-Free Guidance off for the baseline.
+  cfg:
+    drop_prob: 0.0
+    guidance_scale: 1.0
+
+  # Implicit affordance attention (as in the v2 runs).
+  affordance:
+    enabled: true
+    hidden_dim: 192
+
+# ─── Data ─────────────────────────────────────────────────────────────
+data:
+  # Held-out val：val 由 tools/split_val_from_train.py 从 train 按 obj_id 划出
+  # （seed=42、161/3221 物体、与 train/test 双零重叠）。旧配置 val==test 会让
+  # checkpoint 选型用到评测集（历史 run 的 best 分数偏乐观）。
+  train_data: "/home/jiaxuan/data/pose_data/train_fuse_v2_split.json"
+  val_data: "/home/jiaxuan/data/pose_data/val_fuse_v2_split.json"
+  test_data: "/home/jiaxuan/data/pose_data/test_fuse_v2.json"
+  mesh_root: "/home/jiaxuan/data/oakink_obj/processed_data"
+  # Variable-hand contract: gt_poses (B,2,31) canonical order + hand_mask +
+  # hand_side_ids + L_obj + task_types. Required record fields must exist
+  # (no fallbacks). Requires model.architecture: latent_ar.
+  multi_task: true
+  n_points: 4096
+  augment: false
+  point_cloud_source: mesh_sample          # auto | colored_ply | mesh_sample
+  point_cloud_color_mode: fill
+  point_cloud_color_fill: 0.4
+  center_on_object: true
+  obj_pose_quaternion_order: wxyz
+  # relquantile11: translation / L_obj then per-hand 1%/99% quantile map to
+  # [-1,1]; joints stay Shadow-ROM minmax; rot6d passes through. normalize/
+  # denormalize REQUIRE per-sample L_obj in this mode.
+  normalization:
+    enabled: true
+    mode: relquantile11
+    stats_path: tools/norm_stats_v3.json
+
+# ─── Training ─────────────────────────────────────────────────────────
+training:
+  epochs: 200
+  batch_size: 128
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 1000
+  grad_clip: 1.0
+
+  optimizer: "adamw"
+  scheduler: "cosine"
+  num_workers: 12
+  persistent_workers: true
+  prefetch_factor: 2
+  seed: 42
+
+  ema:
+    enabled: false
+    decay: 0.9999
+
+  # bf16 mandatory here: fp16 overflows ModernBERT activations and the
+  # Coconut feedback loop compounds it.
+  precision: bf16
+  fp16: true
+  log_interval: 5000
+  val_interval: 5
+  # Cap validation cost: pose metrics on the first N batches, free-rollout
+  # decision metrics on the first val_decision_max_batches of those (0 = all).
+  # The multi_task val sampler order is shuffled (epoch-fixed), so capped
+  # batches contain a mix of all four task types.
+  val_max_batches: 200
+  val_decision_max_batches: 10
+  keep_best_k: 3
+  save_interval: 10
+
+  # Multi-task validation score (lower = better):
+  #   macro_tt(w_t*trans + w_r*rot + w_j*joint)
+  #   + structure*(1 - macro structure_acc)
+  #   + relative*macro_bimanual(rel_trans + rel_rot)
+  val_score_weights:
+    translation: 3.0
+    rotation: 6.0
+    joint: 1.0
+    structure: 1.0
+    relative: 1.0
+  val_score_reduce: macro
+
+  # Group-internal best match by (group, hand-set signature) buckets.
+  val_group_min: true
+
+  # Per-epoch grouped resampling + scenario (task_type) balancing.
+  # epoch_size null -> sum of the per-group draw counts, split by shares.
+  epoch_sampling:
+    enabled: true
+    # scale_id required: bidex has the same obj_id/pose_id at up to 11 scales
+    # (different geometry); without it groups merge and bidex epochs are ~84%
+    # duplicate draws.
+    group_keys: [obj_id, pose_id, scale_id, guidance]
+    samples_per_group: 1
+    val_samples_per_group: 1
+    scenario_key: task_type
+    scenario_shares:
+      left: 0.15
+      right: 0.15
+      lgbidex: 0.35
+      bidex: 0.35
+    epoch_size: null
+
+# ─── Inference ────────────────────────────────────────────────────────
+inference:
+  num_steps: 10               # Euler ODE steps per hand
+  presence_threshold: 0.5     # sigmoid threshold for emitting hand slot 1
+  batch_size: 256
+
+# ─── Paths ────────────────────────────────────────────────────────────
+paths:
+  output_dir: "outputs/test_v2data_scratch"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"

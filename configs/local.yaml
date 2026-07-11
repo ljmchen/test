@@ -1,0 +1,159 @@
+# DexVLG Local Configuration
+# Same as default.yaml (server/H100), but points at data copied onto this
+# machine's local disk instead of the slow rclone-SFTP mount of
+# /mnt/afs/L202500241 (~4-5MB/s over the network -> data loading alone blows
+# past a multi-minute timeout). Run `bash scripts/sync_local_data.sh` (or see
+# 运行命令.md) to populate local_data/ and pretrained_models/ before using this.
+
+# ─── Model ────────────────────────────────────────────────────────────
+model:
+  # Point cloud encoder (PointNet++ replacing Uni3D)
+  # 3 = xyz-only (encoder drops the rgb passed by encode_condition);
+  # 6 = xyz + rgb. PointNet2Encoder adapts to this value automatically.
+  pc_in_channels: 3          # xyz-only
+  pc_feature_dim: 256
+  num_pc_tokens: 64
+
+  # Language model. language_backbone: bert (default) | modernbert.
+  # ModernBERT (2024, bidirectional, hidden_size 768 == bert_dim) is a drop-in:
+  language_backbone: modernbert
+  bert_model: "pretrained_models/ModernBERT-base"
+  # language_backbone: bert
+  # bert_model: "pretrained_models/bert-base-uncased"
+  bert_dim: 768               # must equal the encoder's hidden_size (BERT/ModernBERT-base = 768)
+  freeze_bert_embeddings: false
+
+  # Fusion transformer
+  fusion_depth: 4
+
+  # Flow-Matching Transformer
+  flow_hidden_dim: 256
+  flow_depth: 6
+  flow_heads: 8
+
+  # Grasp pose dimensions (Shadow Hand)
+  joint_dim: 22               # 22 DOF for Shadow Hand
+
+  # Per-element flow-loss weights. Joints (22 dims) otherwise dominate the MSE;
+  # up-weight translation/rotation. All 1.0 == old unweighted MSE.
+  flow_loss_component_weights:
+    translation: 3.0
+    rotation: 6.0
+    joint: 1.0
+
+  # Hand interaction: per-hand type embeddings + optional cross-hand attention
+  # in the flow-matching transformer. enabled=false -> identical to baseline.
+  hand_interaction:
+    enabled: false
+    cross_hand_attn: false
+
+  # Classifier-Free Guidance (CFG). drop_prob > 0 trains with random condition
+  # dropout; guidance_scale != 1.0 amplifies the conditional signal at inference.
+  # Both at defaults (0 / 1.0) -> identical to baseline (no extra parameters).
+  cfg:
+    drop_prob: 0.0
+    guidance_scale: 1.0
+
+  # Implicit affordance attention. Scores fused PC tokens by task relevance,
+  # creates a weighted summary token appended to the condition sequence.
+  # No separate loss; gradients flow through the flow-matching objective.
+  affordance:
+    enabled: true
+    hidden_dim: 192
+
+# ─── Data ─────────────────────────────────────────────────────────────
+# LGBiDex bimanual format (mirrors dexvlm's LgbiDexDataset input processing).
+# Paths below are LOCAL copies of the server's
+# /mnt/afs/L202500241/asserts/lgbidex/{pose_data,oakink_obj} (v4new split).
+data:
+  train_data: "/home/jiaxuan/data/pose_data/train_v2.json"
+  val_data: "/home/jiaxuan/data/pose_data/test_v2.json"
+  test_data: "/home/jiaxuan/data/pose_data/test_v2.json"
+  mesh_root: "/home/jiaxuan/data/oakink_obj/processed_data"
+  n_points: 4096                    # Must match the PLY tag simplified_part_{N}.ply
+  augment: false                    # Rotation aug breaks PC/grasp correspondence; keep off
+  # Point cloud sourcing (see data/dataset.py)
+  point_cloud_source: mesh_sample          # auto | colored_ply | mesh_sample
+  point_cloud_color_mode: fill      # real (use PLY RGB) | fill (constant)
+  point_cloud_color_fill: 0.4
+  # Object-centered coordinate convention (matches dexvlm)
+  center_on_object: true
+  obj_pose_quaternion_order: wxyz
+  # Per-hand pose normalization (translation+joints); rotation 6D passes through.
+  # mode: minmax11 -> map [min,max] to [-1,1] using fixed factor tables (ROM bounds).
+  #       meastd11  -> standardize by (x-mean)/(2*std) using data-measured factors;
+  #                    needs stats_path (run tools/compute_norm_stats.py to make it).
+  normalization:
+    enabled: true
+    mode: minmax11
+    stats_path: tools/meastd_factors.json   # required when mode: meastd11
+
+# ─── Training ─────────────────────────────────────────────────────────
+training:
+  epochs: 200
+  batch_size: 128 #128
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 1000
+  grad_clip: 1.0
+
+  optimizer: "adamw"
+  scheduler: "cosine"
+  num_workers: 16
+  persistent_workers: true    # keep workers + warm point-cloud cache across epochs
+  prefetch_factor: 2          # batches prefetched per worker (overlaps I/O with GPU)
+  seed: 42
+
+  # Exponential Moving Average of model weights for validation/inference.
+  # enabled=false -> no EMA, identical to baseline.
+  ema:
+    enabled: false
+    decay: 0.9999
+
+  # AMP precision: bf16 | fp16 | fp32. bf16 RECOMMENDED on H100 / with ModernBERT
+  # (fp16 can overflow -> inf -> poisons BatchNorm stats -> permanent NaN). bf16
+  # disables the grad scaler (not needed). `fp16: true/false` kept as a fallback
+  # only when `precision` is unset.
+  precision: bf16
+  fp16: true
+  log_interval: 1000           # train loss written to console + train.log every N steps
+  val_interval: 1             # sampling-based validation every N epochs (not steps)
+  val_max_batches: 0         # cap validation to N batches per run (0 = full val set)
+  keep_best_k: 3              # keep only the best-K checkpoints by val score
+  # last.pt is refreshed every epoch (for resume); additionally keep a numbered
+  # snapshot epoch_XXXX.pt every `save_interval` epochs (0 = disable snapshots).
+  save_interval: 10
+  # Per-component validation metric. true -> MSE (mean squared error);
+  # false -> physical metric (translation L2 distance / rotation geodesic angle / joint L1).
+  val_loss_mse:
+    translation: true
+    rotation: true
+    joint: true
+
+  # Group-internal best match. false -> each prediction scored vs its own record's
+  # GT (one-to-one). true -> scored vs the CLOSEST GT among ALL grasps in its
+  # (obj_id, pose_id, guidance) group, so valid-but-different grasps aren't
+  # penalized (the metric then tracks success far better). Independent of
+  # epoch_sampling; candidates always come from the full val set.
+  val_group_min: true
+
+  # Per-epoch grouped resampling. enabled=false -> use every record each epoch
+  # (original behavior). enabled=true -> each epoch draw `samples_per_group`
+  # grasps from every (group_keys) combo; val uses a fixed `val_samples_per_group`
+  # subset. 'guidance' also matches the 'guidence' spelling.
+  epoch_sampling:
+    enabled: false
+    group_keys: [obj_id, pose_id, guidance]
+    samples_per_group: 1
+    val_samples_per_group: 1
+
+# ─── Inference ────────────────────────────────────────────────────────
+inference:
+  num_steps: 10               # Euler ODE integration steps
+  batch_size: 256
+
+# ─── Paths ────────────────────────────────────────────────────────────
+paths:
+  output_dir: "outputs"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"

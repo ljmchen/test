@@ -42,14 +42,13 @@ import torch
 #   RIGHT std  = [ 0.0833, 0.1079, 0.0681, 0.8953, 0.9212, 1.3979, 0.1687, 0.3412, 0.3086,
 #                  0.3113, 0.1481, 0.3383, 0.2927, 0.3146, 0.1426, 0.3119, 0.3206, 0.3318,
 #                  0.1320, 0.1316, 0.3102, 0.3078, 0.3187, 0.2619, 0.2623, 0.1031, 0.2292, 0.2137]
-#   （完整数值见 tools/pose_stats_v4.json，由 tools/compute_pose_stats.py 生成。）
+#   （完整数值存档于 tools/pose_stats_v4.json；原生成工具 compute_pose_stats.py 已删除，
+#     现行统计工具为 tools/compute_norm_stats.py（relquantile11 stats）。）
 # ════════════════════════════════════════════════════════════════════════════
 
-# 28 rows = translation(3) + axis-angle(3, unused for 6d) + joints(22), each [min, max].
-_LEFT_FACTOR_MINMAX = torch.tensor(
+# Shadow Hand ROM bounds for the 22 joints; identical for both hands.
+_SHADOW_JOINT_ROM_MINMAX = torch.tensor(
     [
-        [-0.28, 0.27], [-0.3, 0.34], [-0.13, 0.28],
-        [-3.14, 3.14], [-3.14, 3.14], [-3.14, 3.14],
         [-0.349, 0.349], [0.0, 1.571], [0.0, 1.571], [0.0, 1.571],
         [-0.349, 0.349], [0.0, 1.571], [0.0, 1.571], [0.0, 1.571],
         [-0.349, 0.349], [0.0, 1.571], [0.0, 1.571], [0.0, 1.571],
@@ -58,17 +57,36 @@ _LEFT_FACTOR_MINMAX = torch.tensor(
     ],
     dtype=torch.float32,
 )
-_RIGHT_FACTOR_MINMAX = torch.tensor(
+
+# 28 rows = translation(3) + axis-angle(3, unused for 6d) + joints(22), each [min, max].
+_LEFT_FACTOR_MINMAX = torch.cat(
     [
-        [-0.27, 0.24], [-0.3, 0.35], [-0.29, 0.22],
-        [-3.14, 3.14], [-3.14, 3.14], [-3.14, 3.14],
-        [-0.349, 0.349], [0.0, 1.571], [0.0, 1.571], [0.0, 1.571],
-        [-0.349, 0.349], [0.0, 1.571], [0.0, 1.571], [0.0, 1.571],
-        [-0.349, 0.349], [0.0, 1.571], [0.0, 1.571], [0.0, 1.571],
-        [0.0, 0.785], [-0.349, 0.349], [0.0, 1.571], [0.0, 1.571], [0.0, 1.571],
-        [-1.047, 1.047], [0.0, 1.222], [-0.209, 0.209], [-0.524, 0.524], [-1.571, 0.0],
+        # v2 (train_v2.json 1%/99% 分位); v1 原值: [-0.1757, 0.1752], [-0.1797, 0.1744], [0.0013, 0.2055]
+        torch.tensor(
+            [
+                [-0.1750, 0.1755], [-0.1817, 0.1747], [0.0042, 0.2006],
+                [-3.14, 3.14], [-3.14, 3.14], [-3.14, 3.14],
+            ],
+            dtype=torch.float32,
+        ),
+        _SHADOW_JOINT_ROM_MINMAX,
     ],
-    dtype=torch.float32,
+    dim=0,
+)
+_RIGHT_FACTOR_MINMAX = torch.cat(
+    [
+        # [-0.27, 0.24], [-0.3, 0.35], [-0.29, 0.22],
+        # v2 (train_v2.json 1%/99% 分位); v1 原值: [-0.1613, 0.1638], [-0.1623, 0.1629], [-0.1570, 0.1449]
+        torch.tensor(
+            [
+                [-0.1636, 0.1649], [-0.1626, 0.1636], [-0.1578, 0.1445],
+                [-3.14, 3.14], [-3.14, 3.14], [-3.14, 3.14],
+            ],
+            dtype=torch.float32,
+        ),
+        _SHADOW_JOINT_ROM_MINMAX,
+    ],
+    dim=0,
 )
 
 
@@ -81,11 +99,14 @@ class LgbidexPoseNormalizer:
         joint_dim: int = 22,
         mode: str = "minmax11",
         meastd: dict | None = None,
+        rel_quantile: dict | None = None,
     ):
         if hand_side not in {"left", "right"}:
             raise ValueError(f"Unsupported hand_side '{hand_side}'.")
-        if mode not in {"minmax11", "meastd11"}:
-            raise ValueError(f"Unsupported mode '{mode}' (use minmax11 | meastd11).")
+        if mode not in {"minmax11", "meastd11", "relquantile11"}:
+            raise ValueError(
+                f"Unsupported mode '{mode}' (use minmax11 | meastd11 | relquantile11)."
+            )
         self.hand_side = hand_side
         self.joint_dim = int(joint_dim)
         self.rotation_dim = 6
@@ -97,6 +118,27 @@ class LgbidexPoseNormalizer:
             self.trans_lo, self.trans_hi = factors[:3, 0], factors[:3, 1]
             self.joint_lo = factors[6 : 6 + self.joint_dim, 0]
             self.joint_hi = factors[6 : 6 + self.joint_dim, 1]
+        elif mode == "relquantile11":
+            if rel_quantile is None:
+                raise ValueError(
+                    "relquantile11 needs per-hand translation quantiles. Run "
+                    "tools/compute_norm_stats.py and point "
+                    "data.normalization.stats_path at the output JSON."
+                )
+            self.trans_q01 = torch.as_tensor(rel_quantile["q01"], dtype=torch.float32)
+            self.trans_q99 = torch.as_tensor(rel_quantile["q99"], dtype=torch.float32)
+            if self.trans_q01.numel() != 3 or self.trans_q99.numel() != 3:
+                raise ValueError(
+                    f"rel_quantile q01/q99 must be 3-dim, got "
+                    f"{self.trans_q01.numel()}/{self.trans_q99.numel()}."
+                )
+            if bool((self.trans_q99 - self.trans_q01 <= 0).any()):
+                raise ValueError(
+                    f"rel_quantile span q99-q01 must be positive per axis, got "
+                    f"q01={self.trans_q01.tolist()} q99={self.trans_q99.tolist()}."
+                )
+            self.joint_lo = _SHADOW_JOINT_ROM_MINMAX[: self.joint_dim, 0]
+            self.joint_hi = _SHADOW_JOINT_ROM_MINMAX[: self.joint_dim, 1]
         else:  # meastd11: standardize translation+joints by (x-mean)/(2*std)
             if meastd is None:
                 raise ValueError(
@@ -121,7 +163,38 @@ class LgbidexPoseNormalizer:
             )
         return pose[..., :3], pose[..., 3:9], pose[..., 9:]
 
-    def normalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
+    def _expand_L(self, L_obj: torch.Tensor | float | None, pose: torch.Tensor) -> torch.Tensor:
+        if L_obj is None:
+            raise ValueError(
+                f"Mode 'relquantile11' ({self.hand_side}) requires L_obj; got None."
+            )
+        L = torch.as_tensor(L_obj, dtype=pose.dtype, device=pose.device)
+        if bool((L <= 0).any()):
+            raise ValueError(f"L_obj must be positive, got {L.tolist()}.")
+        if L.dim() == 0:
+            return L
+        if L.dim() == 1:
+            if pose.dim() < 2 or L.shape[0] != pose.shape[0]:
+                raise ValueError(
+                    f"L_obj shape {tuple(L.shape)} does not broadcast against pose "
+                    f"shape {tuple(pose.shape)}."
+                )
+            return L.view(-1, *([1] * (pose.dim() - 1)))
+        raise ValueError(f"L_obj must be a scalar or 1-D tensor, got dim {L.dim()}.")
+
+    def normalize_pose(
+        self, pose: torch.Tensor, L_obj: torch.Tensor | float | None = None
+    ) -> torch.Tensor:
+        """Normalize a 31-d pose (translation + joints scaled, rot6d pass-through).
+
+        Args:
+            pose: ``(31,)`` / ``(B, 31)`` / ``(B, K, 31)`` pose tensor.
+            L_obj: Object characteristic length; required (scalar or ``(B,)``)
+                for ``relquantile11``, ignored by the other modes.
+
+        Returns:
+            Normalized pose with the same shape as ``pose``.
+        """
         # Only translation + joints are scaled. The 6D rotation is passed through:
         # training targets are already orthonormal (see _to_target_pose) and model
         # outputs get re-orthonormalized downstream by rotation_6d_to_matrix.
@@ -132,12 +205,30 @@ class LgbidexPoseNormalizer:
             jlo, jhi = self.joint_lo.to(d, t), self.joint_hi.to(d, t)
             trans = 2.0 * (trans - tlo) / (thi - tlo + 1e-8) - 1.0
             joints = 2.0 * (joints - jlo) / (jhi - jlo + 1e-8) - 1.0
+        elif self.mode == "relquantile11":
+            L = self._expand_L(L_obj, trans)
+            q01, q99 = self.trans_q01.to(d, t), self.trans_q99.to(d, t)
+            jlo, jhi = self.joint_lo.to(d, t), self.joint_hi.to(d, t)
+            trans = 2.0 * (trans / L - q01) / (q99 - q01) - 1.0
+            joints = 2.0 * (joints - jlo) / (jhi - jlo + 1e-8) - 1.0
         else:  # meastd11
             trans = (trans - self.trans_mean.to(d, t)) / (2.0 * self.trans_std.to(d, t) + 1e-8)
             joints = (joints - self.joint_mean.to(d, t)) / (2.0 * self.joint_std.to(d, t) + 1e-8)
         return torch.cat([trans, rot6d, joints], dim=-1)
 
-    def denormalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
+    def denormalize_pose(
+        self, pose: torch.Tensor, L_obj: torch.Tensor | float | None = None
+    ) -> torch.Tensor:
+        """Invert :meth:`normalize_pose`.
+
+        Args:
+            pose: ``(31,)`` / ``(B, 31)`` / ``(B, K, 31)`` normalized pose tensor.
+            L_obj: Object characteristic length; required (scalar or ``(B,)``)
+                for ``relquantile11``, ignored by the other modes.
+
+        Returns:
+            Denormalized pose with the same shape as ``pose``.
+        """
         trans, rot6d, joints = self._split(pose)
         d, t = pose.device, pose.dtype
         if self.mode == "minmax11":
@@ -145,14 +236,20 @@ class LgbidexPoseNormalizer:
             jlo, jhi = self.joint_lo.to(d, t), self.joint_hi.to(d, t)
             trans = 0.5 * (trans + 1.0) * (thi - tlo) + tlo
             joints = 0.5 * (joints + 1.0) * (jhi - jlo) + jlo
+        elif self.mode == "relquantile11":
+            L = self._expand_L(L_obj, trans)
+            q01, q99 = self.trans_q01.to(d, t), self.trans_q99.to(d, t)
+            jlo, jhi = self.joint_lo.to(d, t), self.joint_hi.to(d, t)
+            trans = (0.5 * (trans + 1.0) * (q99 - q01) + q01) * L
+            joints = 0.5 * (joints + 1.0) * (jhi - jlo) + jlo
         else:  # meastd11
             trans = trans * (2.0 * self.trans_std.to(d, t)) + self.trans_mean.to(d, t)
             joints = joints * (2.0 * self.joint_std.to(d, t)) + self.joint_mean.to(d, t)
         return torch.cat([trans, rot6d, joints], dim=-1)
 
 
-def _load_meastd_factors(stats_path: str) -> dict:
-    """Load per-hand mean/std factors (produced by tools/compute_norm_stats.py)."""
+def _load_stats_file(stats_path: str) -> dict:
+    """Load a stats JSON (produced by tools/compute_norm_stats.py), repo-root aware."""
     from pathlib import Path
 
     path = Path(stats_path).expanduser()
@@ -162,12 +259,17 @@ def _load_meastd_factors(stats_path: str) -> dict:
             path = repo_root / path
     if not path.exists():
         raise FileNotFoundError(
-            f"meastd stats file not found: {path}. Run tools/compute_norm_stats.py first."
+            f"Normalization stats file not found: {path}. Run tools/compute_norm_stats.py first."
         )
     import json
 
     with path.open("r") as f:
         return json.load(f)
+
+
+def _load_meastd_factors(stats_path: str) -> dict:
+    """Load per-hand mean/std factors (produced by tools/compute_norm_stats.py)."""
+    return _load_stats_file(stats_path)
 
 
 def build_hand_normalizers(
@@ -179,18 +281,36 @@ def build_hand_normalizers(
 
         {"enabled": true, "mode": "minmax11"}
         {"enabled": true, "mode": "meastd11", "stats_path": "tools/meastd_factors.json"}
+        {"enabled": true, "mode": "relquantile11", "stats_path": "tools/norm_stats_v3.json"}
     """
     cfg = dict(normalization or {})
     if not cfg.get("enabled", False):
         return None
     mode = str(cfg.get("mode", "minmax11"))
-    meastd_by_side = {"left": None, "right": None}
+    meastd_by_side: dict[str, dict | None] = {"left": None, "right": None}
+    rel_by_side: dict[str, dict | None] = {"left": None, "right": None}
     if mode == "meastd11":
         stats = _load_meastd_factors(str(cfg.get("stats_path", "tools/meastd_factors.json")))
         meastd_by_side = {"left": stats["left"], "right": stats["right"]}
+    elif mode == "relquantile11":
+        stats = _load_stats_file(str(cfg.get("stats_path", "tools/norm_stats_v3.json")))
+        rel_stats = stats.get("translation_rel")
+        if not isinstance(rel_stats, dict) or not all(s in rel_stats for s in ("left", "right")):
+            raise ValueError(
+                "relquantile11 stats file must contain 'translation_rel.left' and "
+                "'translation_rel.right' (produced by tools/compute_norm_stats.py)."
+            )
+        rel_by_side = {
+            side: {"q01": rel_stats[side]["q01"], "q99": rel_stats[side]["q99"]}
+            for side in ("left", "right")
+        }
     return {
         side: LgbidexPoseNormalizer(
-            hand_side=side, joint_dim=joint_dim, mode=mode, meastd=meastd_by_side[side]
+            hand_side=side,
+            joint_dim=joint_dim,
+            mode=mode,
+            meastd=meastd_by_side[side],
+            rel_quantile=rel_by_side[side],
         )
         for side in ("left", "right")
     }

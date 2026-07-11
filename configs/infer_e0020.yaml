@@ -1,0 +1,84 @@
+model:
+  pc_in_channels: 3
+  pc_feature_dim: 256
+  num_pc_tokens: 64
+  language_backbone: modernbert
+  bert_model: pretrained_models/ModernBERT-base
+  bert_dim: 768
+  freeze_bert_embeddings: false
+  fusion_depth: 4
+  flow_hidden_dim: 256
+  flow_depth: 6
+  flow_heads: 8
+  joint_dim: 22
+  flow_loss_component_weights:
+    translation: 3.0
+    rotation: 6.0
+    joint: 1.0
+  hand_interaction:
+    enabled: false
+    cross_hand_attn: false
+  cfg:
+    drop_prob: 0.0
+    guidance_scale: 1.0
+  affordance:
+    enabled: true
+    hidden_dim: 192
+data:
+  train_data: /home/jiaxuan/data/pose_data/train_v1.json
+  val_data: /home/jiaxuan/data/pose_data/test_v1.json
+  test_data: /home/jiaxuan/data/pose_data/test_v1.json
+  mesh_root: /home/jiaxuan/data/oakink_obj/processed_data
+  n_points: 4096
+  augment: false
+  point_cloud_source: mesh_sample
+  point_cloud_color_mode: fill
+  point_cloud_color_fill: 0.4
+  center_on_object: true
+  obj_pose_quaternion_order: wxyz
+  normalization:
+    enabled: true
+    mode: minmax11
+    stats_path: tools/meastd_factors.json
+training:
+  epochs: 200
+  batch_size: 128
+  lr: 0.0001
+  weight_decay: 0.0001
+  warmup_steps: 1000
+  grad_clip: 1.0
+  optimizer: adamw
+  scheduler: cosine
+  num_workers: 16
+  persistent_workers: true
+  prefetch_factor: 4
+  seed: 42
+  ema:
+    enabled: false
+    decay: 0.9999
+  precision: bf16
+  fp16: true
+  log_interval: 1000
+  val_interval: 1
+  val_max_batches: 0
+  keep_best_k: 3
+  val_loss_mse:
+    translation: true
+    rotation: true
+    joint: true
+  val_group_min: true
+  epoch_sampling:
+    enabled: false
+    group_keys:
+    - obj_id
+    - pose_id
+    - guidance
+    samples_per_group: 1
+    val_samples_per_group: 1
+inference:
+  num_steps: 10
+  batch_size: 256
+paths:
+  output_dir: outputs
+  checkpoint_dir: checkpoints
+  log_dir: logs

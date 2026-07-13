@@ -115,7 +115,13 @@ Three kinds of checkpoint land in `outputs/checkpoints/` (rank 0 only):
 ## Inference → convert (4 channels) → dgbench-pami eval / eval3 / eval4
 
 v3 multi-task eval chain: one model, four `task_type`s (`left` / `right` / `lgbidex` /
-`bidex`), each routed to its own bench channel. On this machine:
+`bidex`), each routed to its own bench channel.
+
+**⚠️ 评旧 ckpt 必须配旧 config**：checkpoint 不保存 model config；评旧 ckpt（如 e0029
+及更早，pad 可见分布下训练）必须用旧行为 config（`mask_pad_tokens` 缺省/false）——用现行
+`v3_multitask.yaml` 评旧 ckpt 会静默改变条件分布，分数不可比。
+
+On this machine:
 - mesh_root: `/home/jiaxuan/data/oakink_obj/processed_data`
 - splits: `/home/jiaxuan/data/pose_data/{train_fuse_v2,test_fuse_v2}.json`
   (train = 1,180,992 / test = 273,776 records; task_type mix left/right/lgbidex/bidex;

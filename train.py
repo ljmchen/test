@@ -14,6 +14,8 @@ import logging
 import math
 import os
 import re
+import shutil
+import subprocess
 
 import torch
 import torch.distributed as dist
@@ -50,6 +52,7 @@ from utils.misc import set_seed, count_parameters, AverageMeter
 
 _TRAIN_LOSS_COMPONENT_KEYS = (
     "loss_flow",
+    "loss_rot_geo",
     "loss_presence",
     "loss_side",
     "loss_probe_task",
@@ -96,6 +99,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train DexVLG model")
     parser.add_argument("--config", type=str, default="configs/v3_smoke.yaml")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--init-weights", type=str, default=None,
+        help="Warm-start: load model weights from a checkpoint's "
+             "model_state_dict with strict=False (new params such as the CFG "
+             "null_cond stay at init). Optimizer/scheduler/epoch/global_step "
+             "are NOT restored. Mutually exclusive with --resume.",
+    )
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--output_dir", type=str, default=None)
     return parser.parse_args()
@@ -719,7 +729,8 @@ def validate_multitask(
 
     Returns:
         Dict with ``score`` (compose_score; lower is better), ``per_task``,
-        ``macro``, ``bimanual``, and macro ``trans``/``rot``/``joint``.
+        ``macro``, ``bimanual``, macro ``trans``/``rot``/``joint``, and
+        ``n_samples_evaluated`` (actual samples seen, summed across ranks).
     """
     model.eval()
     net = model.module if hasattr(model, "module") else model
@@ -739,6 +750,7 @@ def validate_multitask(
     trans_dim, rot_dim = net.trans_dim, net.rot_dim
 
     acc = MultiTaskValAccumulator(device=device)
+    n_samples_evaluated = 0
 
     for batch_idx, batch in enumerate(
         tqdm(dataloader, desc="Validation", disable=rank != 0)
@@ -746,6 +758,7 @@ def validate_multitask(
         if max_batches > 0 and batch_idx >= max_batches:
             break
         xyz = batch["xyz"].to(device, non_blocking=True)
+        n_samples_evaluated += int(xyz.shape[0])
         rgb = batch["rgb"].to(device, non_blocking=True)
         gt_poses = batch["gt_poses"].to(device, non_blocking=True)
         hand_mask = batch["hand_mask"].to(device, non_blocking=True)
@@ -804,6 +817,12 @@ def validate_multitask(
             acc.add_relative(tt_ids[pair_ok], rel_trans, rel_rot)
 
     acc.all_reduce(distributed)
+    if distributed and dist.is_available() and dist.is_initialized():
+        n_samples_tensor = torch.tensor(
+            float(n_samples_evaluated), dtype=torch.float64, device=device
+        )
+        dist.all_reduce(n_samples_tensor, op=dist.ReduceOp.SUM)
+        n_samples_evaluated = int(n_samples_tensor.item())
     summary = acc.summary()
     per_task = summary["per_task"]
 
@@ -835,6 +854,7 @@ def validate_multitask(
         "trans": summary["macro"]["trans"],
         "rot": summary["macro"]["rot"],
         "joint": summary["macro"]["joint"],
+        "n_samples_evaluated": int(n_samples_evaluated),
     }
 
 
@@ -976,8 +996,89 @@ def update_best_checkpoints(
     return registry, True
 
 
+def maybe_launch_bench_subset(
+    cfg: dict,
+    output_dir: str,
+    ckpt_dir: str,
+    epoch: int,
+    numbered_ckpt: str | None,
+    logger: logging.Logger,
+) -> None:
+    """Fire-and-forget async bench-subset hook (``training.bench_eval``).
+
+    Rank-0 only, called at epoch end after checkpoints are on disk. Every
+    ``interval`` epochs it detaches ``scripts/bench_subset.sh`` (new session,
+    no wait/join) to measure the real-simulation success rate on a bench
+    subset. ZERO-impact contract with training: never blocks, never touches
+    the training GPUs (the script picks an idle card and excludes the
+    inherited ``CUDA_VISIBLE_DEVICES``), and any launch failure is swallowed
+    into a warning.
+
+    Args:
+        cfg: Full config; reads ``training.bench_eval`` (missing = disabled).
+        output_dir: Training run directory (holds config.yaml backup).
+        ckpt_dir: Checkpoint directory (for last.pt).
+        epoch: 0-based epoch just finished; fires when (epoch+1) % interval == 0.
+        numbered_ckpt: Path of the epoch_XXXX.pt saved this epoch, or None.
+            When None, last.pt is copied to a stable ``bench_snap_e{N}.pt``
+            first (last.pt is overwritten every epoch, so the async reader
+            must never point at it directly).
+        logger: Training logger.
+    """
+    be_cfg = dict(cfg["training"].get("bench_eval", {}) or {})
+    if not bool(be_cfg.get("enabled", False)):
+        return
+    interval = int(be_cfg.get("interval", 20))
+    if interval <= 0 or (epoch + 1) % interval != 0:
+        return
+    try:
+        bench_dir = os.path.join(output_dir, "bench_subset")
+        os.makedirs(bench_dir, exist_ok=True)
+        if numbered_ckpt is not None:
+            ckpt_path = numbered_ckpt
+        else:
+            ckpt_path = os.path.join(output_dir, f"bench_snap_e{epoch}.pt")
+            shutil.copy2(os.path.join(ckpt_dir, "last.pt"), ckpt_path)
+        config_path = os.path.join(output_dir, "config.yaml")  # startup backup
+        exp_tag = f"{os.path.basename(os.path.normpath(output_dir))}_e{epoch}_sub"
+        test_root = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(test_root, "scripts", "bench_subset.sh")
+        gpu = be_cfg.get("gpu", "")
+        cmd = [
+            "bash", script, ckpt_path, config_path, exp_tag,
+            str(be_cfg.get("channels", "lgbidex")),
+            str(be_cfg.get("max_num", 6000)),
+            "" if gpu is None else str(gpu),
+            str(be_cfg.get("n_worker", 48)),
+        ]
+        launch_log = os.path.join(bench_dir, f"launch_e{epoch}.log")
+        with open(launch_log, "ab") as log_f:
+            subprocess.Popen(
+                cmd,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                cwd=test_root,
+            )
+        logger.info(
+            f"[epoch {epoch}] bench_eval hook launched (async, detached): "
+            f"exp={exp_tag} ckpt={ckpt_path} log={launch_log}"
+        )
+    except Exception as exc:  # zero-impact principle: never break training
+        logger.warning(
+            f"[epoch {epoch}] bench_eval hook launch FAILED "
+            f"(training unaffected): {exc!r}"
+        )
+
+
 def main():
     args = parse_args()
+    if args.init_weights and args.resume:
+        raise ValueError(
+            "--init-weights and --resume are mutually exclusive: --resume "
+            "restores the full training state, --init-weights only warm-starts "
+            "model weights (fresh optimizer/scheduler/epoch)."
+        )
     cfg = load_config(args.config)
     rank, local_rank = setup_distributed()
     distributed = dist.is_initialized()
@@ -991,6 +1092,10 @@ def main():
 
     multi_task = bool(cfg["data"].get("multi_task", False))
     architecture = str(cfg["model"].get("architecture", "legacy_bimanual"))
+    # training.validate_enabled=false: skip ALL training-time validation and
+    # best-K selection (val's group-min matching proved blind to bench
+    # regressions); the only quality signal is the async bench_eval hook.
+    validate_enabled = bool(train_cfg.get("validate_enabled", True))
     if multi_task and architecture != "latent_ar":
         raise ValueError(
             "data.multi_task: true requires model.architecture: latent_ar; "
@@ -1024,6 +1129,39 @@ def main():
         total = count_parameters(model)
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"Parameters: {total:,} total, {trainable:,} trainable")
+
+    if args.init_weights:
+        # Warm-start weights only (strict=False so config-added params such as
+        # the CFG null_cond keep their fresh init). Loaded BEFORE the DDP wrap
+        # so the construction-time rank-0 broadcast propagates the weights, and
+        # before the EMA shadow deep-copy so an enabled EMA starts from the
+        # loaded weights instead of random init. Optimizer/scheduler/epoch/
+        # global_step deliberately start fresh.
+        init_ckpt = torch.load(
+            args.init_weights, map_location="cuda", weights_only=False
+        )
+        incompat = model.load_state_dict(
+            init_ckpt["model_state_dict"], strict=False
+        )
+        if rank == 0:
+            logger.info(
+                f"Warm-start --init-weights from {args.init_weights} "
+                f"(ckpt epoch={init_ckpt.get('epoch', '?')}, strict=False): "
+                f"{len(incompat.missing_keys)} missing / "
+                f"{len(incompat.unexpected_keys)} unexpected keys; "
+                "optimizer/scheduler/epoch/global_step start fresh"
+            )
+            if incompat.missing_keys:
+                logger.info(
+                    "  missing (new params keep fresh init), sample: "
+                    f"{incompat.missing_keys[:8]}"
+                )
+            if incompat.unexpected_keys:
+                logger.warning(
+                    "  unexpected (ignored), sample: "
+                    f"{incompat.unexpected_keys[:8]}"
+                )
+        del init_ckpt
 
     if distributed:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
@@ -1110,8 +1248,10 @@ def main():
         **loader_kwargs,
     )
 
+    # validate disabled -> no val_loader at all: every downstream validation
+    # call site (per-epoch + final) is guarded by `val_loader is not None`.
     val_loader = None
-    if os.path.exists(data_cfg.get("val_data", "")):
+    if validate_enabled and os.path.exists(data_cfg.get("val_data", "")):
         val_dataset = DexGraspDataset(
             data_path=data_cfg["val_data"],
             mesh_root=data_cfg["mesh_root"],
@@ -1180,9 +1320,15 @@ def main():
     # registry of (score, path) for the best checkpoints kept on disk (rank 0).
     # Only inherited on --resume: a fresh run must not adopt a previous run's
     # best_*.pt (their scores are not comparable and inherited entries would be
-    # evicted/DELETED by this run's top-K bookkeeping).
-    best_registry = scan_best_checkpoints(ckpt_dir) if (rank == 0 and args.resume) else []
-    if rank == 0 and not args.resume:
+    # evicted/DELETED by this run's top-K bookkeeping). With validate disabled
+    # the registry stays empty: no best_*.pt is produced, and pre-existing ones
+    # are never adopted (hence never evicted/deleted).
+    best_registry = (
+        scan_best_checkpoints(ckpt_dir)
+        if (rank == 0 and args.resume and validate_enabled)
+        else []
+    )
+    if rank == 0 and validate_enabled and not args.resume:
         stale_best = scan_best_checkpoints(ckpt_dir)
         if stale_best:
             logger.warning(
@@ -1214,7 +1360,10 @@ def main():
         global_step = ckpt["global_step"]
         if rank == 0:
             logger.info(f"Resumed from epoch {start_epoch}, step {global_step}")
-            logger.info(f"Existing top-{keep_best_k} best score: {best_score:.4f}")
+            if validate_enabled:
+                logger.info(
+                    f"Existing top-{keep_best_k} best score: {best_score:.4f}"
+                )
 
     val_interval = train_cfg.get("val_interval", 1)
     # per-hand pose denormalizers for validation metrics (None if disabled)
@@ -1249,12 +1398,34 @@ def main():
             f"Batch size: {train_cfg['batch_size']}, LR: {train_cfg['lr']}, "
             f"precision: {_prec} (grad_scaler={_amp_sc})"
         )
-        logger.info(
-            f"Validation: every {val_interval} epoch(s) via "
-            f"{cfg.get('inference', {}).get('num_steps', 10)}-step sampling"
-            + (f", normalized={normalizers is not None}")
-            + (" (val disabled: no val_data)" if val_loader is None else "")
-        )
+        if not validate_enabled:
+            logger.info("!" * 70)
+            logger.info(
+                "VALIDATE DISABLED (training.validate_enabled=false): 训练期不跑任何 "
+                "validate/best-K 选型（不产生 best_*.pt）；checkpoint 仅 last.pt + "
+                "save_interval 快照；训练期唯一质量信号 = bench 子集钩子 "
+                "(training.bench_eval)"
+            )
+            logger.info("!" * 70)
+        else:
+            logger.info(
+                f"Validation: every {val_interval} epoch(s) via "
+                f"{cfg.get('inference', {}).get('num_steps', 10)}-step sampling"
+                + (f", normalized={normalizers is not None}")
+                + (" (val disabled: no val_data)" if val_loader is None else "")
+            )
+        _be_cfg = dict(train_cfg.get("bench_eval", {}) or {})
+        if bool(_be_cfg.get("enabled", False)):
+            _be_gpu = _be_cfg.get("gpu", "")
+            _be_gpu = "" if _be_gpu is None else str(_be_gpu)
+            logger.info(
+                f"bench_eval hook ON (async, detached, 0 training impact): every "
+                f"{int(_be_cfg.get('interval', 20))} epoch(s), "
+                f"channels={_be_cfg.get('channels', 'lgbidex')}, "
+                f"max_num={_be_cfg.get('max_num', 6000)}, "
+                f"gpu='{_be_gpu}' (空=自动找空闲卡), "
+                f"n_worker={_be_cfg.get('n_worker', 48)}"
+            )
         logger.info("-" * 60)
 
     last_epoch = train_cfg["epochs"] - 1
@@ -1299,6 +1470,7 @@ def main():
                 epoch, global_step, cur_best,
                 os.path.join(ckpt_dir, "last.pt"), ema=ema,
             )
+            numbered_ckpt = None
             if save_interval > 0 and (epoch + 1) % save_interval == 0:
                 snap_path = os.path.join(ckpt_dir, f"epoch_{epoch:04d}.pt")
                 save_checkpoint(
@@ -1306,6 +1478,12 @@ def main():
                     epoch, global_step, cur_best, snap_path, ema=ema,
                 )
                 logger.info(f"[epoch {epoch}] saved periodic checkpoint {os.path.basename(snap_path)}")
+                numbered_ckpt = snap_path
+            # Async bench-subset hook: launched only after this epoch's
+            # checkpoints are on disk; fire-and-forget (never blocks training).
+            maybe_launch_bench_subset(
+                cfg, output_dir, ckpt_dir, epoch, numbered_ckpt, logger
+            )
 
     # Final validation so the last state can enter top-K, unless already done.
     if val_loader is not None and not validated_last_epoch:

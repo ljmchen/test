@@ -157,9 +157,11 @@ class FlowMatchingTransformer(nn.Module):
             x_t: Noisy pose, shape (B, num_queries, pose_dim) or (B, pose_dim).
             t: Timestep in [0, 1], shape (B,).
             cond_tokens: Condition features, shape (B, L, cond_dim).
-            hand_ids: Optional hand side ids (0=left, 1=right), shape (B,).
-                When given, the hand type embedding is indexed by hand side
-                semantics; when None, the legacy slot-arange behavior is kept.
+            hand_ids: Optional hand side ids (0=left, 1=right), shape (B,)
+                (one shared id per sample) or (B, Q) (one id per query, for
+                joint multi-hand denoising). When given, the hand type
+                embedding is indexed by hand side semantics; when None, the
+                legacy slot-arange behavior is kept.
             memory_key_padding_mask: Optional bool mask over cond_tokens,
                 shape (B, L); True = pad (excluded from cross-attention).
                 None keeps the legacy all-visible behavior.
@@ -175,10 +177,16 @@ class FlowMatchingTransformer(nn.Module):
         time_emb = sinusoidal_embedding(t, self.time_mlp[0].in_features)
         time_emb = self.time_mlp(time_emb)
 
+        # NOTE: when Q > num_queries (joint denoising on a num_queries=1
+        # model) the slice below yields a single position that broadcasts to
+        # all queries; queries are then differentiated by hand_ids alone.
         x = self.input_proj(x_t) + self.query_pos[:, : x_t.shape[1]]
         if self.use_hand_type_embed:
             if hand_ids is not None:
-                x = x + self.hand_type_embed(hand_ids).unsqueeze(1)
+                hand_emb = self.hand_type_embed(hand_ids)
+                if hand_emb.dim() == 2:
+                    hand_emb = hand_emb.unsqueeze(1)  # (B,) ids -> all queries
+                x = x + hand_emb
             else:
                 slot_ids = torch.arange(x.shape[1], device=x.device)
                 x = x + self.hand_type_embed(slot_ids).unsqueeze(0)

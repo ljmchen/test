@@ -165,6 +165,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of grasps to sample per (deduped) combination. Each becomes a "
              "separate output record with its own candidate_idx (0..N-1).",
     )
+    parser.add_argument(
+        "--guidance-scale", type=float, default=None,
+        help="Override model.cfg.guidance_scale (CFG strength at sampling; only "
+             "effective for checkpoints trained with cfg.drop_prob > 0). "
+             "Default: keep the config value.",
+    )
     return parser.parse_args()
 
 
@@ -179,6 +185,13 @@ def main() -> None:
         # CLI -> cfg passthrough; the model reads model.lang_padding when
         # building the tokenizer call (batch-invariance fix, P0-1).
         cfg["model"]["lang_padding"] = args.lang_padding
+    if args.guidance_scale is not None:
+        # Must land before DexVLG(cfg["model"]) is built: the model reads
+        # cfg.guidance_scale in __init__ (sampling-time CFG scan, T1).
+        cfg_block = cfg["model"].get("cfg") or {}
+        cfg_block["guidance_scale"] = float(args.guidance_scale)
+        cfg["model"]["cfg"] = cfg_block
+        print(f"[info] override model.cfg.guidance_scale = {args.guidance_scale}")
 
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name)

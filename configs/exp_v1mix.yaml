@@ -1,0 +1,169 @@
+# exp_v1mix — T4 v1 丰富 guidance 混回（根因修复：条件可分性）。
+# 目的：v2 把 lgbidex 唯一 guidance 从 11370 种塌缩到 1671 个模板 → 一指令对多旋转
+# 模态。对 lgbidex 记录按 grasp_id 哈希 p=0.5 确定性替换回 v1 guidance（逐条替换、
+# 不双份并存，保持 epoch_sampling 组数与 35% 配比），恢复"一指令↔少数模态"。
+# train_data 指向 tools 生成的 train_fuse_v2v1mix_split.json（由并行 agent 生成；
+# 启动前先确认该文件存在且通过对齐校验）。val/test 保持 v2 不动——若 val（v2 文本）
+# 不动而 bench 上升 → 收益来自表征而非文本记忆。
+# 基于 v3_multitask.yaml，除 data.train_data / epochs / output_dir 外其余键一致。
+# warm-start 启动（tmux + 空闲卡，勿用 GPU0）：
+#   tmux new -d -s exp_v1mix
+#   tmux send-keys -t exp_v1mix 'cd /home/jiaxuan/exp-pami/test && CUDA_VISIBLE_DEVICES=<idle> \
+#     /mnt/conda/jiaxuan/miniconda3/envs/dexvlg/bin/python train.py \
+#     --config configs/exp_v1mix.yaml \
+#     --init-weights outputs/test_v2data_scratch/checkpoints/epoch_0079.pt \
+#     2>&1 | tr "\r" "\n" >> outputs/exp_v1mix/launch.log' Enter
+
+# ─── Model ────────────────────────────────────────────────────────────
+model:
+  architecture: latent_ar
+
+  # Point cloud encoder (PointNet++)
+  pc_in_channels: 3          # xyz-only
+  pc_feature_dim: 256
+  num_pc_tokens: 64
+
+  # Language model
+  language_backbone: modernbert
+  bert_model: "pretrained_models/ModernBERT-base"
+  bert_dim: 768               # must equal the encoder hidden_size
+  freeze_bert_embeddings: false
+  lang_padding: max_length
+  mask_pad_tokens: true
+
+  # Fusion transformer
+  fusion_depth: 4
+
+  # Flow-Matching Transformer (one call per hand under latent_ar)
+  flow_hidden_dim: 256
+  flow_depth: 6
+  flow_heads: 8
+
+  joint_dim: 22               # Shadow Hand DOF
+
+  # Per-element flow-loss weights (joints otherwise dominate the MSE).
+  flow_loss_component_weights:
+    translation: 3.0
+    rotation: 6.0
+    joint: 1.0
+
+  # Autoregressive latent reasoner (Coconut-style thinking + per-hand steps).
+  reasoner:
+    dim: 512
+    depth: 4
+    num_heads: 8
+    num_thinking_tokens: 6
+    max_hands: 2
+    feedback_norm: true
+    mlp_ratio: 4.0
+    hand_cond_noise_std: 0.1
+    aux_probe:
+      enabled: false
+      hidden_dim: 256
+      num_task_types: 4
+
+  # Total-loss weights for the latent_ar objective.
+  loss_weights:
+    flow: 1.0
+    presence: 0.5
+    side: 0.5
+    probe: 0.1
+
+  hand_interaction:
+    enabled: true
+    cross_hand_attn: false
+
+  # Classifier-Free Guidance off for this run.
+  cfg:
+    drop_prob: 0.0
+    guidance_scale: 1.0
+
+  # Implicit affordance attention (as in the v2 runs).
+  affordance:
+    enabled: true
+    hidden_dim: 192
+
+# ─── Data ─────────────────────────────────────────────────────────────
+data:
+  # ★ T4：lgbidex p=0.5 混回 v1 guidance 的训练集（逐条替换，组数/配比不变）。
+  train_data: "/home/jiaxuan/data/pose_data/train_fuse_v2v1mix_split.json"
+  # val/test 保持 v2 不动（测试文本仍在分布内；健康信号判读见头注）。
+  val_data: "/home/jiaxuan/data/pose_data/val_fuse_v2_split.json"
+  test_data: "/home/jiaxuan/data/pose_data/test_fuse_v2.json"
+  mesh_root: "/home/jiaxuan/data/oakink_obj/processed_data"
+  multi_task: true
+  n_points: 4096
+  augment: false
+  point_cloud_source: mesh_sample          # auto | colored_ply | mesh_sample
+  point_cloud_color_mode: fill
+  point_cloud_color_fill: 0.4
+  center_on_object: true
+  obj_pose_quaternion_order: wxyz
+  normalization:
+    enabled: true
+    mode: relquantile11
+    stats_path: tools/norm_stats_v3.json
+
+# ─── Training ─────────────────────────────────────────────────────────
+training:
+  epochs: 20                  # ★ warm-start 微调短训（--init-weights epoch_0079.pt）
+  batch_size: 128
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 1000
+  grad_clip: 1.0
+
+  optimizer: "adamw"
+  scheduler: "cosine"
+  num_workers: 12
+  persistent_workers: true
+  prefetch_factor: 2
+  seed: 42
+
+  ema:
+    enabled: false
+    decay: 0.9999
+
+  precision: bf16
+  fp16: true
+  log_interval: 5000
+  val_interval: 5
+  val_max_batches: 200
+  val_decision_max_batches: 10
+  keep_best_k: 3
+  save_interval: 10
+
+  val_score_weights:
+    translation: 3.0
+    rotation: 6.0
+    joint: 1.0
+    structure: 1.0
+    relative: 1.0
+  val_score_reduce: macro
+
+  val_group_min: true
+
+  epoch_sampling:
+    enabled: true
+    group_keys: [obj_id, pose_id, scale_id, guidance]
+    samples_per_group: 1
+    val_samples_per_group: 1
+    scenario_key: task_type
+    scenario_shares:
+      left: 0.15
+      right: 0.15
+      lgbidex: 0.35
+      bidex: 0.35
+    epoch_size: null
+
+# ─── Inference ────────────────────────────────────────────────────────
+inference:
+  num_steps: 10               # Euler ODE steps per hand
+  presence_threshold: 0.5     # sigmoid threshold for emitting hand slot 1
+  batch_size: 256
+
+# ─── Paths ────────────────────────────────────────────────────────────
+paths:
+  output_dir: "outputs/exp_v1mix"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"

@@ -22,6 +22,8 @@ import torch.nn.functional as F
 from .pointnet2 import PointNet2Encoder
 from .flow_matching import FlowMatchingTransformer
 from .latent_reasoner import LatentReasoner
+from utils.metrics import TASK_TYPES
+from utils.rotation import rotation_6d_to_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +295,57 @@ class DexVLG(nn.Module):
         ).view(1, 1, self.pose_dim)
         self.register_buffer("flow_loss_weight", flow_weight, persistent=False)
 
+        # Per-task scaling ON TOP of flow_loss_weight (T2). Config:
+        #   model.flow_loss_task_scales: {lgbidex: {rotation: 2.0}, ...}
+        # Component names map to pose dims: translation [0:3], rotation [3:9],
+        # joint [9:9+joint_dim]. Rows follow utils/metrics.TASK_TYPES order
+        # (left, right, lgbidex, bidex). Key absent -> all-ones table = no-op.
+        self._component_slices = {
+            "translation": slice(0, self.trans_dim),
+            "rotation": slice(self.trans_dim, self.trans_dim + self.rot_dim),
+            "joint": slice(self.trans_dim + self.rot_dim, self.pose_dim),
+        }
+        task_scales_cfg = cfg.get("flow_loss_task_scales", {}) or {}
+        task_scale_table = torch.ones(len(TASK_TYPES), self.pose_dim)
+        for task_name, comp_scales in task_scales_cfg.items():
+            if task_name not in TASK_TYPES:
+                raise ValueError(
+                    f"flow_loss_task_scales: unknown task_type '{task_name}'; "
+                    f"expected one of {TASK_TYPES}"
+                )
+            row = TASK_TYPES.index(task_name)
+            for comp_name, scale in (comp_scales or {}).items():
+                if comp_name not in self._component_slices:
+                    raise ValueError(
+                        f"flow_loss_task_scales[{task_name}]: unknown component "
+                        f"'{comp_name}'; expected one of "
+                        f"{tuple(self._component_slices)}"
+                    )
+                task_scale_table[row, self._component_slices[comp_name]] = float(scale)
+        self.register_buffer("task_scale_table", task_scale_table, persistent=False)
+
+        # Geodesic rotation auxiliary loss (T3). Config:
+        #   model.rot_geodesic: {weight: 0.5, task_types: [lgbidex], t_min: 0.3}
+        # Key absent or weight == 0 -> complete no-op. Empty task_types list
+        # applies the loss to every task type.
+        rg_cfg = cfg.get("rot_geodesic", {}) or {}
+        self.rot_geo_weight = float(rg_cfg.get("weight", 0.0))
+        self.rot_geo_t_min = float(rg_cfg.get("t_min", 0.3))
+        rg_tasks = list(rg_cfg.get("task_types", []) or [])
+        unknown_rg = sorted(set(rg_tasks) - set(TASK_TYPES))
+        if unknown_rg:
+            raise ValueError(
+                f"rot_geodesic.task_types: unknown task_type(s) {unknown_rg}; "
+                f"expected members of {TASK_TYPES}"
+            )
+        rot_geo_task_mask = (
+            torch.tensor([t in rg_tasks for t in TASK_TYPES], dtype=torch.bool)
+            if rg_tasks
+            else torch.ones(len(TASK_TYPES), dtype=torch.bool)
+        )
+        self.register_buffer("rot_geo_task_mask", rot_geo_task_mask, persistent=False)
+        self.rot_geo_needs_task_ids = bool(rg_tasks)
+
         self.pc_encoder = PointNet2Encoder(
             in_channels=cfg.get("pc_in_channels", 6),
             num_output_tokens=num_pc_tokens,
@@ -323,6 +376,18 @@ class DexVLG(nn.Module):
             raise ValueError(
                 f"Unknown model.architecture '{self.architecture}'; "
                 "expected 'legacy_bimanual' or 'latent_ar'"
+            )
+
+        # Joint bimanual flow denoising (A1). When enabled (latent_ar only),
+        # all present hands of a sample are denoised together as multiple flow
+        # queries sharing one timestep; queries interact through the flow
+        # transformer's (self-/cross-hand) attention, which replaces the
+        # prev-hand memory token. Default False = the sequential per-hand
+        # behavior, bit-identical to before this switch existed.
+        self.joint_hand_denoise = bool(cfg.get("joint_hand_denoise", False))
+        if self.joint_hand_denoise and self.architecture != "latent_ar":
+            raise ValueError(
+                "model.joint_hand_denoise requires architecture 'latent_ar'"
             )
 
         if self.architecture == "latent_ar":
@@ -363,6 +428,11 @@ class DexVLG(nn.Module):
                 "side": float(lw.get("side", 0.5)),
                 "probe": float(lw.get("probe", 0.1)),
             }
+            # cross_hand_attn is derived from joint_hand_denoise: the joint
+            # path feeds both hands as queries that must attend to each other
+            # (single-query calls degenerate to attending only to themselves);
+            # the sequential path conditions hand 2 via the prev-hand memory
+            # token instead and keeps it off.
             self.flow_transformer = FlowMatchingTransformer(
                 pose_dim=self.pose_dim,
                 num_queries=1,
@@ -370,7 +440,10 @@ class DexVLG(nn.Module):
                 depth=flow_depth,
                 num_heads=flow_heads,
                 cond_dim=bert_dim,
-                hand_interaction={"enabled": True, "cross_hand_attn": False},
+                hand_interaction={
+                    "enabled": True,
+                    "cross_hand_attn": self.joint_hand_denoise,
+                },
             )
         else:
             hand_interaction = cfg.get("hand_interaction", None)
@@ -594,7 +667,10 @@ class DexVLG(nn.Module):
 
         Runs the reasoner teacher-forced over the canonical hand sequence and
         trains one flow-matching call per hand slot (independent timesteps),
-        plus presence (BCE) and side (CE) decision losses.
+        plus presence (BCE) and side (CE) decision losses. With
+        joint_hand_denoise the per-slot calls are replaced by ONE joint call
+        per sample over all present hands (shared timestep, queries attend to
+        each other; see _joint_flow_terms) — the reasoner losses are unchanged.
 
         Args:
             xyz: Point positions, shape (B, N, 3).
@@ -639,12 +715,124 @@ class DexVLG(nn.Module):
         if self.training and self.null_cond is not None and self.cfg_drop_prob > 0:
             drop_mask = torch.rand(B, device=device) < self.cfg_drop_prob
 
+        weight = self.flow_loss_weight.view(1, self.pose_dim)
+        if task_type_ids is not None:
+            # (B, pose_dim) per-task component scaling; all-ones without the
+            # flow_loss_task_scales config key (no-op).
+            weight = weight * self.task_scale_table[task_type_ids]
+
+        use_rot_geo = self.rot_geo_weight > 0.0
+        if use_rot_geo and self.rot_geo_needs_task_ids and task_type_ids is None:
+            raise ValueError(
+                "rot_geodesic.task_types is set: compute_loss_latent_ar "
+                "requires task_type_ids to filter the geodesic loss"
+            )
+
+        mask_f = hand_mask.float()
+        if self.joint_hand_denoise:
+            flow_sum, rot_geo_sum, rot_geo_cnt = self._joint_flow_terms(
+                gt_poses=gt_poses,
+                hand_mask=hand_mask,
+                hand_side_ids=hand_side_ids,
+                memory=memory,
+                mem_mask=mem_mask,
+                z_cond=z_cond,
+                hand_hidden=ro["hand_hidden"],
+                weight=weight,
+                drop_mask=drop_mask,
+                use_rot_geo=use_rot_geo,
+                task_type_ids=task_type_ids,
+            )
+        else:
+            flow_sum, rot_geo_sum, rot_geo_cnt = self._sequential_flow_terms(
+                gt_poses=gt_poses,
+                mask_f=mask_f,
+                hand_side_ids=hand_side_ids,
+                memory=memory,
+                mem_mask=mem_mask,
+                z_cond=z_cond,
+                hand_hidden=ro["hand_hidden"],
+                gt_prev_side=gt_prev_side,
+                gt_prev_pose=gt_prev_pose,
+                weight=weight,
+                drop_mask=drop_mask,
+                use_rot_geo=use_rot_geo,
+                task_type_ids=task_type_ids,
+            )
+
+        loss_flow = flow_sum / hand_mask.sum().clamp(min=1)
+        loss_presence = F.binary_cross_entropy_with_logits(
+            ro["presence_logits"].float(), mask_f
+        )
+        loss_side = F.cross_entropy(
+            ro["side_logits"][hand_mask].float(),
+            hand_side_ids[hand_mask].clamp(min=0),
+        )
+
+        total = (
+            self.loss_weights["flow"] * loss_flow
+            + self.loss_weights["presence"] * loss_presence
+            + self.loss_weights["side"] * loss_side
+        )
+        losses = {
+            "loss_flow": loss_flow,
+            "loss_presence": loss_presence,
+            "loss_side": loss_side,
+        }
+        if use_rot_geo:
+            # 0 when every slot is masked out (e.g. all t <= t_min this step)
+            loss_rot_geo = rot_geo_sum / rot_geo_cnt.clamp(min=1.0)
+            total = total + self.rot_geo_weight * loss_rot_geo
+            losses["loss_rot_geo"] = loss_rot_geo
+        if self.reasoner.probe_enabled:
+            if task_type_ids is None or log_l_obj is None:
+                raise ValueError(
+                    "aux_probe is enabled: task_type_ids and log_l_obj are required"
+                )
+            probe = self.reasoner.probe_forward(ro["z_tokens"])
+            loss_probe_task = F.cross_entropy(
+                probe["task_logits"].float(), task_type_ids
+            )
+            loss_probe_lobj = F.mse_loss(probe["log_l_obj"].float(), log_l_obj.float())
+            total = total + self.loss_weights["probe"] * (
+                loss_probe_task + loss_probe_lobj
+            )
+            losses["loss_probe_task"] = loss_probe_task
+            losses["loss_probe_lobj"] = loss_probe_lobj
+        losses["loss"] = total
+        return losses
+
+    def _sequential_flow_terms(
+        self,
+        gt_poses: torch.Tensor,
+        mask_f: torch.Tensor,
+        hand_side_ids: torch.Tensor,
+        memory: torch.Tensor,
+        mem_mask: torch.Tensor | None,
+        z_cond: torch.Tensor,
+        hand_hidden: torch.Tensor,
+        gt_prev_side: torch.Tensor,
+        gt_prev_pose: torch.Tensor,
+        weight: torch.Tensor,
+        drop_mask: torch.Tensor | None,
+        use_rot_geo: bool,
+        task_type_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Legacy per-slot flow terms: one flow call per hand slot with its own
+        timestep; hand slot 1 sees hand slot 0 through the prev-hand token.
+
+        Returns:
+            (flow_sum, rot_geo_sum, rot_geo_cnt) accumulated over both slots.
+        """
+        B = gt_poses.shape[0]
+        device = gt_poses.device
+
         prev_tok = self.prev_proj(
             self.reasoner.embed_prev_hand(gt_prev_side, gt_prev_pose)
         ).unsqueeze(1)
 
-        weight = self.flow_loss_weight.view(1, self.pose_dim)
-        mask_f = hand_mask.float()
+        rot_geo_sum = gt_poses.new_zeros(())
+        rot_geo_cnt = gt_poses.new_zeros(())
         flow_sum = gt_poses.new_zeros(())
         for s in range(2):
             gt_s = gt_poses[:, s]
@@ -653,7 +841,7 @@ class DexVLG(nn.Module):
             x_t = (1.0 - t[:, None]) * noise + t[:, None] * gt_s
             target_v = gt_s - noise
 
-            tokens = [memory, z_cond, self.h_proj(ro["hand_hidden"][:, s]).unsqueeze(1)]
+            tokens = [memory, z_cond, self.h_proj(hand_hidden[:, s]).unsqueeze(1)]
             if s == 1:
                 tokens.append(prev_tok)
             cond_s = torch.cat(tokens, dim=1)
@@ -686,42 +874,154 @@ class DexVLG(nn.Module):
             per_sample = (weight * (pred_v - target_v) ** 2).mean(dim=-1)
             flow_sum = flow_sum + (per_sample * mask_f[:, s]).sum()
 
-        loss_flow = flow_sum / hand_mask.sum().clamp(min=1)
-        loss_presence = F.binary_cross_entropy_with_logits(
-            ro["presence_logits"].float(), mask_f
-        )
-        loss_side = F.cross_entropy(
-            ro["side_logits"][hand_mask].float(),
-            hand_side_ids[hand_mask].clamp(min=0),
-        )
-
-        total = (
-            self.loss_weights["flow"] * loss_flow
-            + self.loss_weights["presence"] * loss_presence
-            + self.loss_weights["side"] * loss_side
-        )
-        losses = {
-            "loss_flow": loss_flow,
-            "loss_presence": loss_presence,
-            "loss_side": loss_side,
-        }
-        if self.reasoner.probe_enabled:
-            if task_type_ids is None or log_l_obj is None:
-                raise ValueError(
-                    "aux_probe is enabled: task_type_ids and log_l_obj are required"
+            if use_rot_geo:
+                # Geodesic angle between the flow-endpoint estimate
+                # x1_hat = x_t + (1-t) * pred_v and the GT rotation. rot6d is
+                # normalization pass-through (relquantile11), so the [3:9]
+                # slice is the true rotation. float() guards acos under bf16.
+                x1_hat = x_t + (1.0 - t[:, None]) * pred_v
+                r_pred = rotation_6d_to_matrix(x1_hat[:, 3:9].float())
+                r_gt = rotation_6d_to_matrix(gt_s[:, 3:9].float())
+                trace = (
+                    (r_pred.transpose(-1, -2) @ r_gt)
+                    .diagonal(dim1=-2, dim2=-1)
+                    .sum(-1)
                 )
-            probe = self.reasoner.probe_forward(ro["z_tokens"])
-            loss_probe_task = F.cross_entropy(
-                probe["task_logits"].float(), task_type_ids
+                geo = torch.acos(((trace - 1.0) / 2.0).clamp(-1 + 1e-6, 1 - 1e-6))
+                # mask = hand present x task-type filter x t-gate (x1_hat is
+                # too noisy near t=0 for a useful rotation signal)
+                geo_mask = mask_f[:, s] * (t > self.rot_geo_t_min).float()
+                if task_type_ids is not None:
+                    geo_mask = geo_mask * self.rot_geo_task_mask[task_type_ids].float()
+                rot_geo_sum = rot_geo_sum + (geo * geo_mask).sum()
+                rot_geo_cnt = rot_geo_cnt + geo_mask.sum()
+
+        return flow_sum, rot_geo_sum, rot_geo_cnt
+
+    def _joint_flow_terms(
+        self,
+        gt_poses: torch.Tensor,
+        hand_mask: torch.Tensor,
+        hand_side_ids: torch.Tensor,
+        memory: torch.Tensor,
+        mem_mask: torch.Tensor | None,
+        z_cond: torch.Tensor,
+        hand_hidden: torch.Tensor,
+        weight: torch.Tensor,
+        drop_mask: torch.Tensor | None,
+        use_rot_geo: bool,
+        task_type_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Joint flow terms (joint_hand_denoise): every present hand of a
+        sample becomes one flow query, all queries share the sample's single
+        timestep, and one flow forward denoises them together (queries
+        interact via the flow transformer's attention). The prev-hand token
+        is not used; instead BOTH present hand-step hiddens h_s join the
+        cross-attention memory.
+
+        The batch is split by hand count (1 vs 2 present hands) and each
+        subgroup runs one forward with static query count — absent slots
+        never become queries, so they receive no gradient by construction.
+
+        Returns:
+            (flow_sum, rot_geo_sum, rot_geo_cnt) accumulated over all present
+            hands; normalization matches the sequential path (sum over
+            present hands of the per-hand weighted MSE mean).
+        """
+        B = gt_poses.shape[0]
+        device = gt_poses.device
+
+        # one t per sample, shared by all of that sample's hands
+        t = torch.rand(B, device=device)
+        h_all = self.h_proj(hand_hidden)  # (B, 2, bert_dim)
+        n_hands = hand_mask.sum(dim=1)
+        weight_full = weight.expand(B, -1)  # (B, pose_dim)
+
+        flow_sum = gt_poses.new_zeros(())
+        rot_geo_sum = gt_poses.new_zeros(())
+        rot_geo_cnt = gt_poses.new_zeros(())
+
+        for n in (1, 2):
+            sel = n_hands == n
+            if not sel.any():
+                continue
+            idx = sel.nonzero(as_tuple=True)[0]
+            b = idx.numel()
+            if n == 2:
+                gt_q = gt_poses[idx]  # (b, 2, pose_dim)
+                sides_q = hand_side_ids[idx].clamp(min=0)  # (b, 2)
+                h_q = h_all[idx]  # (b, 2, bert_dim)
+            else:
+                # single present slot (canonical packing puts it at slot 0;
+                # gather by mask to stay contract-agnostic)
+                slots = hand_mask[idx].float().argmax(dim=1, keepdim=True)  # (b, 1)
+                gt_q = gt_poses[idx].gather(
+                    1, slots[..., None].expand(-1, -1, self.pose_dim)
+                )
+                sides_q = hand_side_ids[idx].gather(1, slots).clamp(min=0)
+                h_q = h_all[idx].gather(
+                    1, slots[..., None].expand(-1, -1, h_all.shape[-1])
+                )
+
+            t_q = t[idx]
+            noise = torch.randn_like(gt_q)
+            x_t = (1.0 - t_q[:, None, None]) * noise + t_q[:, None, None] * gt_q
+            target_v = gt_q - noise
+
+            # memory = [fused pc+lang(+aff), z_cond, h_s of present hands]
+            cond = torch.cat([memory[idx], z_cond[idx], h_q], dim=1)
+            cond_mask = None
+            if mem_mask is not None:
+                # z/h tokens appended after memory are all valid (False)
+                mm = mem_mask[idx]
+                cond_mask = torch.cat(
+                    [mm, mm.new_zeros(b, cond.shape[1] - mm.shape[1])], dim=1
+                )
+            if drop_mask is not None and drop_mask.any():
+                dm = drop_mask[idx]
+                null = self.null_cond.expand(b, cond.shape[1], -1)
+                cond = torch.where(dm[:, None, None], null, cond)
+                if cond_mask is not None:
+                    # dropped rows are all null tokens -> fully valid
+                    cond_mask = torch.where(
+                        dm[:, None], torch.zeros_like(cond_mask), cond_mask
+                    )
+
+            pred_v = self.flow_transformer(
+                x_t,
+                t_q,
+                cond,
+                hand_ids=sides_q,
+                memory_key_padding_mask=cond_mask,
             )
-            loss_probe_lobj = F.mse_loss(probe["log_l_obj"].float(), log_l_obj.float())
-            total = total + self.loss_weights["probe"] * (
-                loss_probe_task + loss_probe_lobj
-            )
-            losses["loss_probe_task"] = loss_probe_task
-            losses["loss_probe_lobj"] = loss_probe_lobj
-        losses["loss"] = total
-        return losses
+            per_hand = (weight_full[idx].unsqueeze(1) * (pred_v - target_v) ** 2).mean(
+                dim=-1
+            )  # (b, n)
+            flow_sum = flow_sum + per_hand.sum()
+
+            if use_rot_geo:
+                # per-query geodesic on the flow-endpoint estimate; every
+                # query is a present hand, so the mask is only the t-gate x
+                # task-type filter (broadcast over the sample's queries).
+                x1_hat = x_t + (1.0 - t_q)[:, None, None] * pred_v
+                r_pred = rotation_6d_to_matrix(x1_hat[..., 3:9].float())
+                r_gt = rotation_6d_to_matrix(gt_q[..., 3:9].float())
+                trace = (
+                    (r_pred.transpose(-1, -2) @ r_gt)
+                    .diagonal(dim1=-2, dim2=-1)
+                    .sum(-1)
+                )  # (b, n)
+                geo = torch.acos(((trace - 1.0) / 2.0).clamp(-1 + 1e-6, 1 - 1e-6))
+                geo_mask = (t_q > self.rot_geo_t_min).float()
+                if task_type_ids is not None:
+                    geo_mask = geo_mask * self.rot_geo_task_mask[
+                        task_type_ids[idx]
+                    ].float()
+                geo_mask = geo_mask[:, None].expand_as(geo)
+                rot_geo_sum = rot_geo_sum + (geo * geo_mask).sum()
+                rot_geo_cnt = rot_geo_cnt + geo_mask.sum()
+
+        return flow_sum, rot_geo_sum, rot_geo_cnt
 
     @torch.no_grad()
     def sample_latent_ar(
@@ -763,6 +1063,16 @@ class DexVLG(nn.Module):
             raise ValueError(
                 "force_sides and force_mask must be provided together: pad slots "
                 "in force_sides hold -1, which is meaningless without the mask"
+            )
+        if self.joint_hand_denoise:
+            return self._sample_latent_ar_joint(
+                xyz,
+                rgb,
+                texts,
+                num_steps=num_steps,
+                presence_threshold=presence_threshold,
+                force_sides=force_sides,
+                force_mask=force_mask,
             )
         B = xyz.shape[0]
         device = xyz.device
@@ -851,6 +1161,197 @@ class DexVLG(nn.Module):
             prev_side = side_s
             prev_pose = x
 
+        return {
+            "poses": poses,
+            "hand_mask": out_mask,
+            "hand_sides": out_sides,
+            "presence_probs": presence_probs,
+            "side_logits": all_side_logits,
+        }
+
+    def _flow_euler(
+        self,
+        x: torch.Tensor,
+        cond: torch.Tensor,
+        cond_mask: torch.Tensor | None,
+        hand_ids: torch.Tensor,
+        num_steps: int,
+    ) -> torch.Tensor:
+        """Euler-integrate the flow ODE from t=0 to t=1 (joint sampling path).
+
+        Args:
+            x: Initial noise, shape (B, pose_dim) or (B, n, pose_dim).
+            cond: Condition tokens, shape (B, L, bert_dim).
+            cond_mask: Optional bool pad mask over cond, shape (B, L).
+            hand_ids: Hand side ids, shape (B,) or (B, n).
+            num_steps: Euler integration steps.
+
+        Returns:
+            Integrated pose(s), same shape as x.
+        """
+        B = x.shape[0]
+        use_cfg = self.null_cond is not None and self.cfg_guidance_scale != 1.0
+        if use_cfg:
+            null_tokens = self.null_cond.expand(B, cond.shape[1], -1)
+        dt = 1.0 / num_steps
+        for step in range(num_steps):
+            t = torch.full((B,), step / num_steps, device=x.device)
+            v = self.flow_transformer(
+                x, t, cond, hand_ids=hand_ids, memory_key_padding_mask=cond_mask
+            )
+            if use_cfg:
+                # null tokens are all valid -> no padding mask
+                v_uncond = self.flow_transformer(x, t, null_tokens, hand_ids=hand_ids)
+                v = v_uncond + self.cfg_guidance_scale * (v - v_uncond)
+            x = x + v * dt
+        return x
+
+    def _extend_cond_mask(
+        self, mem_mask: torch.Tensor | None, cond: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Pad-mask over [memory, extra tokens]: extra tokens are all valid."""
+        if mem_mask is None:
+            return None
+        return torch.cat(
+            [
+                mem_mask,
+                mem_mask.new_zeros(cond.shape[0], cond.shape[1] - mem_mask.shape[1]),
+            ],
+            dim=1,
+        )
+
+    @torch.no_grad()
+    def _sample_latent_ar_joint(
+        self,
+        xyz: torch.Tensor,
+        rgb: torch.Tensor,
+        texts: list[str],
+        num_steps: int = 10,
+        presence_threshold: float = 0.5,
+        force_sides: torch.Tensor | None = None,
+        force_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Joint sampling (joint_hand_denoise): decisions as usual, poses jointly.
+
+        The reasoner decision chain is computed exactly as in the sequential
+        path: thinking rollout, hand step 0, a single-query Euler pass for
+        slot 0 conditioned on [memory, z, h_0] (this preliminary pose feeds
+        the reasoner's step-1 prev-hand conditioning, mirroring the sequential
+        sampler bit-exactly), then hand step 1. Presence/side outputs are
+        therefore identical to the sequential path under the same weights and
+        seed.
+
+        Final poses: samples with only slot 0 present keep the preliminary
+        pose (that IS the trained single-hand configuration); samples with
+        both slots present are re-sampled from fresh noise in ONE joint Euler
+        integration where both hands are flow queries attending to each other,
+        conditioned on [memory, z, h_0, h_1].
+
+        Args / Returns: same contract as sample_latent_ar.
+        """
+        B = xyz.shape[0]
+        device = xyz.device
+
+        memory, memory_mask = self.encode_condition(xyz, rgb, texts)
+        mem_mask = memory_mask if self.mask_pad_tokens else None
+        z_tokens, seq_state = self.reasoner.rollout_thinking(
+            memory, mem_key_padding_mask=mem_mask
+        )
+        z_cond = self.z_proj(z_tokens)
+
+        presence_probs = torch.zeros(B, 2, device=device)
+        all_side_logits = torch.zeros(B, 2, 2, device=device)
+
+        # ── decision chain (identical computation to the sequential path) ──
+        h_0, presence_logit, side_logits, seq_state = self.reasoner.step_hand(
+            seq_state, memory, 0, None, None, mem_key_padding_mask=mem_mask
+        )
+        presence_probs[:, 0] = torch.sigmoid(presence_logit.float())
+        all_side_logits[:, 0] = side_logits.float()
+        if force_mask is not None:
+            mask_0 = force_mask[:, 0].bool()
+        else:
+            mask_0 = torch.ones(B, dtype=torch.bool, device=device)
+        if force_sides is not None:
+            side_0 = force_sides[:, 0].long().clamp(min=0)
+        else:
+            side_0 = side_logits.float().argmax(dim=-1)
+
+        h0_tok = self.h_proj(h_0).unsqueeze(1)
+        cond_0 = torch.cat([memory, z_cond, h0_tok], dim=1)
+        x_0 = self._flow_euler(
+            torch.randn(B, self.pose_dim, device=device),
+            cond_0,
+            self._extend_cond_mask(mem_mask, cond_0),
+            side_0,
+            num_steps,
+        )
+
+        h_1, presence_logit, side_logits, seq_state = self.reasoner.step_hand(
+            seq_state, memory, 1, side_0, x_0, mem_key_padding_mask=mem_mask
+        )
+        prob_1 = torch.sigmoid(presence_logit.float())
+        presence_probs[:, 1] = prob_1
+        all_side_logits[:, 1] = side_logits.float()
+        if force_mask is not None:
+            mask_1 = force_mask[:, 1].bool()
+        else:
+            mask_1 = prob_1 > presence_threshold
+        if force_sides is not None:
+            side_1 = force_sides[:, 1].long().clamp(min=0)
+        else:
+            logits_1 = side_logits.float().scatter(
+                1, side_0.unsqueeze(1), float("-inf")
+            )
+            side_1 = logits_1.argmax(dim=-1)
+
+        poses = torch.zeros(B, 2, self.pose_dim, device=device)
+        poses[:, 0] = torch.where(mask_0.unsqueeze(-1), x_0, torch.zeros_like(x_0))
+        h1_tok = self.h_proj(h_1).unsqueeze(1)
+
+        # ── joint denoising: both slots present -> 2 queries, one Euler pass ──
+        both = mask_0 & mask_1
+        if both.any():
+            idx = both.nonzero(as_tuple=True)[0]
+            cond_j = torch.cat(
+                [memory[idx], z_cond[idx], h0_tok[idx], h1_tok[idx]], dim=1
+            )
+            sides_j = torch.stack([side_0[idx], side_1[idx]], dim=1)
+            x_j = self._flow_euler(
+                torch.randn(idx.numel(), 2, self.pose_dim, device=device),
+                cond_j,
+                self._extend_cond_mask(
+                    mem_mask[idx] if mem_mask is not None else None, cond_j
+                ),
+                sides_j,
+                num_steps,
+            )
+            poses[idx] = x_j
+
+        # degenerate forced case {slot 1 only}: single-query pass on [mem, z, h_1]
+        only_1 = mask_1 & ~mask_0
+        if only_1.any():
+            idx = only_1.nonzero(as_tuple=True)[0]
+            cond_1 = torch.cat([memory[idx], z_cond[idx], h1_tok[idx]], dim=1)
+            x_1 = self._flow_euler(
+                torch.randn(idx.numel(), self.pose_dim, device=device),
+                cond_1,
+                self._extend_cond_mask(
+                    mem_mask[idx] if mem_mask is not None else None, cond_1
+                ),
+                side_1[idx],
+                num_steps,
+            )
+            poses[idx, 1] = x_1
+
+        out_mask = torch.stack([mask_0, mask_1], dim=1)
+        out_sides = torch.stack(
+            [
+                torch.where(mask_0, side_0, torch.full_like(side_0, -1)),
+                torch.where(mask_1, side_1, torch.full_like(side_1, -1)),
+            ],
+            dim=1,
+        )
         return {
             "poses": poses,
             "hand_mask": out_mask,

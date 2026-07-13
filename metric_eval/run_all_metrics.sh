@@ -36,6 +36,16 @@ GPU="${3:-2}"
 METRICS="${4:-convert,div,q1,fid}"
 INPUT_ABS="$(readlink -f "$INPUT")"
 RECORD="$R/metrics_record.md"
+# 中间产物带 tag，避免跨 tag 分步/并发时 div/q1/fid 读到别的 run 的转换结果
+CONV_L="$R/results_left_${TAG}.json"
+CONV_R="$R/results_right_${TAG}.json"
+
+require_convert() {
+  if [ ! -f "$CONV_L" ] || [ ! -f "$CONV_R" ]; then
+    echo "错误: 缺少 $CONV_L 或 $CONV_R —— 请先对 tag=$TAG 跑 metrics=convert" >&2
+    exit 1
+  fi
+}
 
 source /mnt/conda/jiaxuan/miniconda3/etc/profile.d/conda.sh
 conda activate dexgys
@@ -50,26 +60,33 @@ log "input=$INPUT_ABS"
 if has convert; then
   log "1/4 转换 world->物体系 + 分组 (convert_to_gays.py)"
   python convert_to_gays.py -i "$INPUT_ABS" -o "$R" 2>&1 | tee "$R/convert_${TAG}.log"
+  # 立即固化为带 tag 的副本，后续步骤只读带 tag 文件
+  cp -f "$R/results_left.json" "$CONV_L"
+  cp -f "$R/results_right.json" "$CONV_R"
+  log "转换结果已固化: $CONV_L / $CONV_R"
 fi
 
 if has div; then
   log "2/4 多样性 DGTR+GAYS (CPU)"
+  require_convert
   CUDA_VISIBLE_DEVICES="" python eval_dgtr_diversity.py \
-    -l "$R/results_left.json" -r "$R/results_right.json" \
+    -l "$CONV_L" -r "$CONV_R" \
     -o "$R/diversity_${TAG}.json" 2>&1 | tee "$R/diversity_${TAG}.log"
 fi
 
 if has q1; then
   log "3/4 Q1/pen/valid_q1 GAYS (GPU $GPU, 约5h)"
+  require_convert
   CUDA_VISIBLE_DEVICES="$GPU" python eval_gays_q1.py \
-    -l "$R/results_left.json" -r "$R/results_right.json" \
+    -l "$CONV_L" -r "$CONV_R" \
     -o "$R/q1_${TAG}.json" 2>&1 | tee "$R/q1_${TAG}.log"
 fi
 
 if has fid; then
   log "4/4 深度 FID GAYS/PointNet++ (GPU $GPU, 约2.5h)"
+  require_convert
   CUDA_VISIBLE_DEVICES="$GPU" python eval_gays_fid.py \
-    -l "$R/results_left.json" -r "$R/results_right.json" \
+    -l "$CONV_L" -r "$CONV_R" \
     -o "$R/fid_${TAG}.json" --batch-size 64 2>&1 | tee "$R/fid_${TAG}.log"
 fi
 

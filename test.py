@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 
 import numpy as np
@@ -50,6 +51,23 @@ def denormalize_predictions(
         pred_poses[f"{hand}_joints"] = pose[:, trans_dim + rot_dim :]
         gt_poses[:, i] = normalizers[hand].denormalize_pose(gt_poses[:, i].float())
     return pred_poses, gt_poses
+
+
+def _sanitize_json(obj):
+    """Recursively replace NaN/Inf with None so the output is valid JSON.
+
+    validate_multitask returns float('nan') for task/hand combos without data;
+    json.dump would otherwise emit a bare NaN that jq/json.loads reject.
+    """
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json(v) for v in obj]
+    if isinstance(obj, np.floating):
+        obj = float(obj)
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
 
 
 def parse_args() -> argparse.Namespace:
@@ -251,19 +269,24 @@ def evaluate_latent_ar(
 
     max_batches = int(cfg["training"].get("val_max_batches", 0))
     n_total = len(dataset)
-    n_evaluated = n_total if max_batches <= 0 else min(n_total, max_batches * args.batch_size)
-    truncated = n_evaluated < n_total
-    print(f"评测 {n_evaluated}/{n_total} 条（val_max_batches={max_batches}, "
+    n_evaluated_est = n_total if max_batches <= 0 else min(n_total, max_batches * args.batch_size)
+    print(f"评测约 {n_evaluated_est}/{n_total} 条（val_max_batches={max_batches}, "
           f"batch={args.batch_size}）(latent_ar, per-task-type)")
-    if truncated:
-        print(f"[WARNING] 评测被截断：仅评 {n_evaluated}/{n_total} 条 "
+    if n_evaluated_est < n_total:
+        print(f"[WARNING] 评测被截断：仅评约 {n_evaluated_est}/{n_total} 条 "
               f"(val_max_batches={max_batches})。传 --val-max-batches 0 可评全量。")
 
     metrics = validate_multitask(
         model, loader, cfg, rank=0, distributed=False,
         normalizers=normalizers, group_candidates=group_candidates,
     )
-    metrics["n_evaluated"] = int(n_evaluated)
+    # Prefer the real count accumulated inside the validation loop over the
+    # max_batches*batch_size estimate (exact for partial last batches too).
+    n_evaluated = int(metrics.get("n_samples_evaluated", n_evaluated_est))
+    truncated = n_evaluated < n_total
+    if truncated and n_evaluated != n_evaluated_est:
+        print(f"[WARNING] 实际仅评 {n_evaluated}/{n_total} 条。")
+    metrics["n_evaluated"] = n_evaluated
     metrics["n_total"] = int(n_total)
     metrics["truncated"] = bool(truncated)
     metrics["val_max_batches"] = int(max_batches)
@@ -348,7 +371,7 @@ def main():
         print("=" * 60)
 
     with open(os.path.join(args.output_dir, "metrics.json"), "w") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(_sanitize_json(metrics), f, indent=2, allow_nan=False)
 
     if predictions:
         with open(os.path.join(args.output_dir, "predictions.json"), "w") as f:

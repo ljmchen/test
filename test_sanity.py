@@ -318,6 +318,114 @@ def test_latent_ar_sample_contract():
     print("[PASS] latent_ar sample output contract (free + forced)")
 
 
+def _make_grace_model():
+    """Tiny CPU latent_ar DexVLG with GRACE enabled for the sanity test."""
+    from models.dexvlg import DexVLG
+
+    cfg = {
+        "architecture": "latent_ar",
+        "pc_in_channels": 3,
+        "pc_feature_dim": 32,
+        "num_pc_tokens": 8,
+        "bert_model": "bert-base-uncased",
+        "bert_dim": 96,
+        "freeze_bert_embeddings": True,
+        "fusion_depth": 1,
+        "flow_hidden_dim": 32,
+        "flow_depth": 1,
+        "flow_heads": 4,
+        "joint_dim": 22,
+        "reasoner": {
+            "dim": 32,
+            "depth": 1,
+            "num_heads": 4,
+            "num_thinking_tokens": 2,
+            "max_hands": 2,
+            "hand_cond_noise_std": 0.1,
+        },
+        "loss_weights": {"flow": 1.0, "presence": 0.5, "side": 0.5},
+        "grace": {
+            "enabled": True,
+            "num_approach_anchors": 4,
+            "hidden_dim": 16,
+            "condition": True,
+            "w_contact": 0.5,
+            "w_anchor": 0.5,
+            "w_approach": 0.25,
+            "w_rel_rot": 0.5,
+        },
+    }
+    model = DexVLG(cfg)
+    model.eval()
+    return model
+
+
+def test_grace_latent_ar():
+    model = _make_grace_model()
+
+    B, N = 2, 256
+    torch.manual_seed(3)
+    xyz = torch.randn(B, N, 3)
+    rgb = torch.rand(B, N, 3)
+    texts = ["grasp with both hands", "grasp with the right hand"]
+    gt_poses = torch.randn(B, 2, 31)
+    gt_poses[1, 1] = 0.0
+    hand_mask = torch.tensor([[True, True], [True, False]])
+    hand_side_ids = torch.tensor([[0, 1], [1, -1]])
+    grasp_center = torch.randn(B, 2, 3) * 0.1
+    approach_dir = torch.nn.functional.normalize(torch.randn(B, 2, 3), dim=-1)
+    # pad slot mirrors the collate zero-padding: grasp_center/approach_dir are
+    # exactly [0,0,0] there. The zero-norm approach_dir is the critical case —
+    # a norm-divided cosine would give 0/0 = NaN and silently poison the loss.
+    grasp_center[1, 1] = 0.0
+    approach_dir[1, 1] = 0.0
+    log_l_obj = torch.randn(B)
+
+    torch.manual_seed(0)
+    out = model(
+        xyz, rgb, texts,
+        gt_poses=gt_poses, hand_mask=hand_mask, hand_side_ids=hand_side_ids,
+        log_l_obj=log_l_obj, grasp_center=grasp_center, approach_dir=approach_dir,
+    )
+    for key in (
+        "loss", "loss_flow", "loss_presence", "loss_side",
+        "loss_contact", "loss_anchor", "loss_approach", "loss_rel_rot",
+    ):
+        assert key in out, f"missing '{key}'"
+        assert torch.isfinite(out[key]), f"non-finite '{key}' (zero-norm pad NaN?)"
+    print(f"  GRACE loss: {out['loss'].item():.4f}")
+
+    # backward: every parameter that receives gradient must stay finite
+    # (guards the F.normalize-near-zero exploding-grad path in the HOW head).
+    out["loss"].backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads), "non-finite GRACE grad"
+
+    # pad-slot invariance incl. the zero-norm approach_dir case: garbage in the
+    # padded slot must not change the loss (masking verified).
+    garbage = gt_poses.clone(); garbage[1, 1] = 1e3
+    gc2 = grasp_center.clone(); gc2[1, 1] = 1e3
+    torch.manual_seed(0)
+    out2 = model(
+        xyz, rgb, texts,
+        gt_poses=garbage, hand_mask=hand_mask, hand_side_ids=hand_side_ids,
+        log_l_obj=log_l_obj, grasp_center=gc2, approach_dir=approach_dir,
+    )
+    assert torch.isfinite(out2["loss"]), "pad-slot garbage NaN-poisoned the loss"
+    assert torch.allclose(out["loss"], out2["loss"], atol=1e-4), (
+        "masked pad slot leaked into the GRACE loss"
+    )
+    print("  Pad-slot garbage (incl. zero-norm approach) leaves the loss unchanged")
+
+    # sampling rebuilds GRACE tokens from the model's own predicted hiddens
+    with torch.no_grad():
+        s = model.sample_latent_ar(xyz, rgb, texts, num_steps=2)
+    assert s["poses"].shape == (B, 2, 31)
+    assert bool(s["hand_mask"][:, 0].all()), "hand slot 0 must always be emitted"
+
+    print("[PASS] GRACE latent_ar loss + pad-mask + backward + sampling")
+
+
 def test_metrics_alignment():
     from utils.metrics import (
         align_hands_by_side,
@@ -391,6 +499,7 @@ def main():
         ("relquantile11 normalizer", test_relquantile_roundtrip),
         ("latent_ar mixed batch", test_latent_ar_mixed_batch),
         ("latent_ar sample contract", test_latent_ar_sample_contract),
+        ("GRACE latent_ar", test_grace_latent_ar),
         ("Metrics alignment", test_metrics_alignment),
     ]
 

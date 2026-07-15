@@ -200,21 +200,34 @@ class PointNet2Encoder(nn.Module):
         self.sa3 = SetAbstraction(num_output_tokens, 0.4, 64, 256, [256, 256, output_dim])
 
     def forward(
-        self, xyz: torch.Tensor, features: torch.Tensor | None = None
-    ) -> torch.Tensor:
+        self,
+        xyz: torch.Tensor,
+        features: torch.Tensor | None = None,
+        return_centers: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             xyz: Point positions, shape (B, N, 3).
             features: Point features (e.g., RGB), shape (B, N, C). Ignored when
                 the encoder is configured xyz-only (in_channels == 3), so the
                 caller may pass colors unconditionally.
+            return_centers: When True, also return the final set-abstraction
+                token centers ``xyz3`` (B, num_output_tokens, 3) in the SAME
+                (raw, object-centered) frame as the input ``xyz``. These are the
+                FPS centers of the output tokens (index-aligned with the
+                returned features) and are the visualizable substrate for a
+                grounded affordance/contact heatmap. Default False keeps the
+                legacy single-tensor return bit-identical.
 
         Returns:
-            Token features, shape (B, num_output_tokens, output_dim).
+            Token features, shape (B, num_output_tokens, output_dim); or, when
+            ``return_centers``, ``(features, xyz3)`` with ``xyz3`` (B, num_output_tokens, 3).
         """
         if self.feature_dim == 0:
             features = None  # xyz-only: drop colors to match the first SA layer
         xyz1, feat1 = self.sa1(xyz, features)
         xyz2, feat2 = self.sa2(xyz1, feat1)
-        _, feat3 = self.sa3(xyz2, feat2)
+        xyz3, feat3 = self.sa3(xyz2, feat2)
+        if return_centers:
+            return feat3, xyz3
         return feat3

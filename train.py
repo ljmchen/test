@@ -57,6 +57,10 @@ _TRAIN_LOSS_COMPONENT_KEYS = (
     "loss_side",
     "loss_probe_task",
     "loss_probe_lobj",
+    "loss_contact",
+    "loss_anchor",
+    "loss_approach",
+    "loss_rel_rot",
 )
 
 
@@ -244,6 +248,15 @@ def train_one_epoch(
                     ),
                     "log_l_obj": l_obj.log(),
                 }
+                # GRACE self-supervised targets (present only when
+                # data.grace_targets.enabled); required by the GRACE losses.
+                if "grasp_center" in batch:
+                    extra_inputs["grasp_center"] = batch["grasp_center"].cuda(
+                        non_blocking=True
+                    )
+                    extra_inputs["approach_dir"] = batch["approach_dir"].cuda(
+                        non_blocking=True
+                    )
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -1186,6 +1199,7 @@ def main():
         obj_pose_quaternion_order=data_cfg.get("obj_pose_quaternion_order", "wxyz"),
         normalization=data_cfg.get("normalization", None),
         multi_task=multi_task,
+        grace_targets=data_cfg.get("grace_targets", None),
     )
     train_dataset = DexGraspDataset(
         data_path=data_cfg["train_data"],

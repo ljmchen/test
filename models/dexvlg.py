@@ -28,6 +28,26 @@ from utils.rotation import rotation_6d_to_matrix
 logger = logging.getLogger(__name__)
 
 
+def _fibonacci_sphere(num_points: int) -> torch.Tensor:
+    """Deterministic, near-uniform unit vectors on S^2 (Fibonacci lattice).
+
+    A data-free codebook of candidate approach directions: index ``k`` is a
+    fixed unit vector, identical on every run (no clustering, no data pass).
+    Used by GRACE as the anchor set the reasoner classifies over.
+
+    Args:
+        num_points: Number of anchor directions M.
+
+    Returns:
+        Unit vectors, shape (M, 3).
+    """
+    i = torch.arange(num_points, dtype=torch.float32)
+    z = 1.0 - 2.0 * (i + 0.5) / num_points
+    r = torch.sqrt(torch.clamp(1.0 - z * z, min=0.0))
+    theta = torch.pi * (3.0 - 5.0 ** 0.5) * i
+    return torch.stack([r * torch.cos(theta), r * torch.sin(theta), z], dim=-1)
+
+
 class SimpleTokenizer:
     """Fallback tokenizer when BERT tokenizer is unavailable.
 
@@ -280,6 +300,9 @@ class DexVLG(nn.Module):
         self.rot_dim = 6
         self.joint_dim = joint_dim
         self.pose_dim = self.trans_dim + self.rot_dim + joint_dim
+        # Number of PointNet++ tokens; the fused memory is [pc(num_pc), lang(, aff)]
+        # so memory[:, :num_pc] are the PC tokens (used for GRACE contact pooling).
+        self.num_pc = num_pc_tokens
 
         # Per-element flow-loss weights. Joints occupy 22/31 dims and otherwise
         # dominate the plain MSE, leaving translation (3) / rotation (6)
@@ -378,6 +401,17 @@ class DexVLG(nn.Module):
                 "expected 'legacy_bimanual' or 'latent_ar'"
             )
 
+        # GRACE (Grounded Reasoning over Approach & Contact). The flag is read
+        # for EVERY architecture so a mis-configured legacy model raises loudly
+        # and `self.use_grace` is always defined. The heads/buffers/losses only
+        # materialize inside the latent_ar block below (they need the reasoner
+        # hidden state); default (no `model.grace`) -> use_grace False -> zero
+        # new params, tokens, losses, or required batch fields (bit-identical).
+        grace_cfg = cfg.get("grace", {}) or {}
+        self.use_grace = bool(grace_cfg.get("enabled", False))
+        if self.use_grace and self.architecture != "latent_ar":
+            raise ValueError("model.grace.enabled requires architecture 'latent_ar'")
+
         # Joint bimanual flow denoising (A1). When enabled (latent_ar only),
         # all present hands of a sample are denoised together as multiple flow
         # queries sharing one timestep; queries interact through the flow
@@ -445,6 +479,70 @@ class DexVLG(nn.Module):
                     "cross_hand_attn": self.joint_hand_denoise,
                 },
             )
+
+            # ── GRACE heads (gated by model.grace.enabled) ──────────────────
+            # Three supervised, visualizable "thoughts" produced from the
+            # reasoner's per-hand hidden state h_s and fed back as flow
+            # condition tokens: WHERE (contact heatmap over PC tokens), HOW
+            # (categorical approach direction on an S^2 codebook), RELATE
+            # (inter-hand relative rotation). The flow OUTPUT space is unchanged.
+            if self.use_grace:
+                if self.joint_hand_denoise:
+                    raise NotImplementedError(
+                        "GRACE is wired for the sequential per-hand flow path; "
+                        "combining it with joint_hand_denoise is not supported "
+                        "yet (the joint flow-term/sampler token wiring is left "
+                        "unverified on purpose). Set joint_hand_denoise: false."
+                    )
+                self.grace_num_anchors = int(grace_cfg.get("num_approach_anchors", 64))
+                grace_hidden = int(grace_cfg.get("hidden_dim", 256))
+                # WHERE: contact query pooling over the fused PC tokens.
+                self.grace_q = nn.Linear(reasoner_dim, bert_dim)
+                # HOW: categorical posterior over the S^2 approach codebook.
+                self.grace_approach = nn.Sequential(
+                    nn.Linear(reasoner_dim, grace_hidden),
+                    nn.GELU(),
+                    nn.Linear(grace_hidden, self.grace_num_anchors),
+                )
+                self.grace_approach_embed = nn.Linear(3, bert_dim)
+                self.register_buffer(
+                    "grace_anchors",
+                    _fibonacci_sphere(self.grace_num_anchors),
+                    persistent=False,
+                )
+                # RELATE: inter-hand relative wrist rotation R0^T R1 (rot6d).
+                self.grace_rel_head = nn.Linear(2 * reasoner_dim, self.rot_dim)
+                self.grace_rel_embed = nn.Linear(self.rot_dim, bert_dim)
+
+                self.grace_condition = bool(grace_cfg.get("condition", True))
+                self.grace_detach = bool(grace_cfg.get("detach_condition", False))
+                self.grace_sigma_scale = float(grace_cfg.get("contact_sigma_scale", 0.3))
+                self.grace_sigma_min = float(grace_cfg.get("contact_sigma_min", 0.01))
+                self.grace_sigma_max = float(grace_cfg.get("contact_sigma_max", 0.05))
+                self.grace_w = {
+                    "contact": float(grace_cfg.get("w_contact", 0.5)),
+                    "anchor": float(grace_cfg.get("w_anchor", 0.5)),
+                    "approach": float(grace_cfg.get("w_approach", 0.25)),
+                    "rel_rot": float(grace_cfg.get("w_rel_rot", 0.5)),
+                }
+                # Optional per-task gating (mirrors rot_geo_task_mask): [] = all
+                # task types; only then is task_type_ids required (see below).
+                g_tasks = list(grace_cfg.get("task_types", []) or [])
+                unknown_g = sorted(set(g_tasks) - set(TASK_TYPES))
+                if unknown_g:
+                    raise ValueError(
+                        f"grace.task_types: unknown task_type(s) {unknown_g}; "
+                        f"expected members of {TASK_TYPES}"
+                    )
+                grace_task_mask = (
+                    torch.tensor([t in g_tasks for t in TASK_TYPES], dtype=torch.bool)
+                    if g_tasks
+                    else torch.ones(len(TASK_TYPES), dtype=torch.bool)
+                )
+                self.register_buffer(
+                    "grace_task_mask", grace_task_mask, persistent=False
+                )
+                self.grace_needs_task_ids = bool(g_tasks)
         else:
             hand_interaction = cfg.get("hand_interaction", None)
             self.flow_transformer = FlowMatchingTransformer(
@@ -499,21 +597,32 @@ class DexVLG(nn.Module):
         xyz: torch.Tensor,
         rgb: torch.Tensor,
         texts: list[str],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_centers: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode point cloud + language into fused condition tokens.
 
         Args:
             xyz: Point positions, shape (B, N, 3).
             rgb: Point colors, shape (B, N, 3).
             texts: Language instructions, length B.
+            return_centers: When True, also return the PointNet++ token centers
+                ``xyz3`` (B, num_pc, 3) in the raw object frame — the substrate
+                GRACE grounds its contact target on. Default False keeps the
+                legacy 2-tuple return bit-identical for all other callers.
 
         Returns:
-            fused: Fused condition tokens, shape (B, L_total, bert_dim).
+            fused: Fused condition tokens, shape (B, L_total, bert_dim). The
+                first ``num_pc`` tokens are the PC tokens (position-aligned with
+                ``xyz3`` when requested).
             key_padding_mask: Bool mask over fused, shape (B, L_total);
                 True = language pad token. PC tokens and the affordance
                 summary token are always valid (False).
+            xyz3 (only when return_centers): PC token centers, shape (B, num_pc, 3).
         """
-        pc_tokens = self.pc_encoder(xyz, rgb)
+        if return_centers:
+            pc_tokens, xyz3 = self.pc_encoder(xyz, rgb, return_centers=True)
+        else:
+            pc_tokens = self.pc_encoder(xyz, rgb)
         pc_tokens = self.projector(pc_tokens)
 
         lang_features, lang_mask = self.encode_language(texts, xyz.device)
@@ -537,6 +646,8 @@ class DexVLG(nn.Module):
                 [key_padding_mask, key_padding_mask.new_zeros(B, 1)], dim=1
             )
 
+        if return_centers:
+            return fused, key_padding_mask, xyz3
         return fused, key_padding_mask
 
     def compute_loss(
@@ -652,6 +763,152 @@ class DexVLG(nn.Module):
 
         return results
 
+    def _grace_heads(
+        self, hand_hidden: torch.Tensor, pc_tokens: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """GRACE WHERE + HOW heads from the per-hand reasoner hidden states.
+
+        Args:
+            hand_hidden: Per-hand reasoner hiddens, shape (B, H, reasoner_dim).
+            pc_tokens: Fused PC condition tokens, shape (B, num_pc, bert_dim).
+
+        Returns:
+            Dict with contact_logits (B, H, num_pc), contact_tok (B, H, bert_dim),
+            approach_logits (B, H, M), a_hat (B, H, 3), approach_tok
+            (B, H, bert_dim).
+        """
+        q = self.grace_q(hand_hidden)  # (B, H, bert_dim)
+        scale = pc_tokens.shape[-1] ** 0.5
+        contact_logits = torch.einsum("bhd,bnd->bhn", q, pc_tokens) / scale
+        contact_tok = torch.einsum(
+            "bhn,bnd->bhd", torch.softmax(contact_logits, dim=-1), pc_tokens
+        )
+        approach_logits = self.grace_approach(hand_hidden)  # (B, H, M)
+        a_hat = F.normalize(
+            torch.softmax(approach_logits, dim=-1) @ self.grace_anchors, dim=-1
+        )  # (B, H, 3)
+        approach_tok = self.grace_approach_embed(a_hat)  # (B, H, bert_dim)
+        return {
+            "contact_logits": contact_logits,
+            "contact_tok": contact_tok,
+            "approach_logits": approach_logits,
+            "a_hat": a_hat,
+            "approach_tok": approach_tok,
+        }
+
+    def _grace_rel(self, h_pair: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """GRACE RELATE head: predicted inter-hand relative rotation (rot6d).
+
+        Args:
+            h_pair: Both hands' reasoner hiddens, shape (B, 2, reasoner_dim).
+
+        Returns:
+            rel_rot6d: (B, 6) predicted relative rotation R0^T R1 as 6D.
+            rel_tok: (B, bert_dim) relative-rotation condition token.
+        """
+        r6 = self.grace_rel_head(torch.cat([h_pair[:, 0], h_pair[:, 1]], dim=-1))
+        return r6, self.grace_rel_embed(r6)
+
+    def _grace_losses(
+        self,
+        g: dict[str, torch.Tensor],
+        rel_rot6d: torch.Tensor,
+        xyz3: torch.Tensor,
+        gt_poses: torch.Tensor,
+        grasp_center: torch.Tensor,
+        approach_dir: torch.Tensor,
+        hand_mask: torch.Tensor,
+        log_l_obj: torch.Tensor,
+        task_type_ids: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        """The four self-supervised GRACE losses (all masked to present hands).
+
+        Targets are derived from GT geometry — no external labels. Legal under
+        relquantile11 (rot6d is normalization pass-through) and frame-correct
+        (grasp_center / approach_dir and xyz3 are both in raw object meters).
+
+        Args:
+            g: Output of :meth:`_grace_heads`, per-hand shape (B, 2, *).
+            rel_rot6d: Predicted relative rotation, shape (B, 6).
+            xyz3: PC token centers (raw object frame), shape (B, num_pc, 3).
+            gt_poses: GT poses (rot6d pass-through), shape (B, 2, pose_dim).
+            grasp_center: Self-derived contact centers (raw frame), shape (B, 2, 3).
+            approach_dir: Self-derived unit approach dirs (raw frame), shape (B, 2, 3).
+            hand_mask: Slot validity, shape (B, 2) bool.
+            log_l_obj: Log object characteristic length, shape (B,).
+            task_type_ids: Optional task ids, shape (B,); required iff
+                grace_needs_task_ids.
+
+        Returns:
+            Dict with loss_contact / loss_anchor / loss_approach / loss_rel_rot.
+        """
+        B = xyz3.shape[0]
+        if self.grace_needs_task_ids and task_type_ids is None:
+            raise ValueError(
+                "grace.task_types is set: compute_loss_latent_ar requires "
+                "task_type_ids to gate the GRACE losses"
+            )
+        # per-hand weight = present AND (task allowed); pad slots -> 0.
+        per_hand_w = hand_mask.float()  # (B, 2)
+        if task_type_ids is not None:
+            per_hand_w = per_hand_w * self.grace_task_mask[task_type_ids].float()[:, None]
+        denom = per_hand_w.sum().clamp(min=1.0)
+
+        # ── WHERE: soft-CE to a scale-aware Gaussian over the num_pc centers ──
+        L = log_l_obj.exp()  # (B,)
+        sigma = (self.grace_sigma_scale * L).clamp(
+            self.grace_sigma_min, self.grace_sigma_max
+        )  # (B,)
+        d2 = ((xyz3[:, None, :, :] - grasp_center[:, :, None, :]) ** 2).sum(-1)  # (B,2,N)
+        q = torch.softmax(
+            -d2 / (2.0 * (sigma[:, None, None] ** 2) + 1e-12), dim=-1
+        ).detach()  # stop-grad target (xyz3 carries encoder gradient) — audit FIX 3
+        log_p = torch.log_softmax(g["contact_logits"], dim=-1)  # (B, 2, N)
+        contact_ce = -(q * log_p).sum(-1)  # (B, 2)
+        loss_contact = (contact_ce * per_hand_w).sum() / denom
+
+        # ── HOW anchor: CE to the nearest S^2 codebook direction (fp32 argmax) ──
+        anchor_label = (
+            approach_dir.detach().float() @ self.grace_anchors.float().t()
+        ).argmax(dim=-1)  # (B, 2)
+        anchor_ce = F.cross_entropy(
+            g["approach_logits"].reshape(B * 2, -1).float(),
+            anchor_label.reshape(B * 2),
+            reduction="none",
+        ).reshape(B, 2)
+        loss_anchor = (anchor_ce * per_hand_w).sum() / denom
+
+        # ── HOW approach: 1 - cos to the GT direction. a_hat and approach_dir
+        # are unit for PRESENT hands; padded slots carry approach_dir == 0 so the
+        # dot is 0 -> loss 1 (FINITE — never a 0/0 NaN), then zeroed by
+        # per_hand_w. Do NOT divide by ‖approach_dir‖ (audit FIX 1).
+        approach_cos = (g["a_hat"] * approach_dir).sum(-1)  # (B, 2)
+        loss_approach = ((1.0 - approach_cos) * per_hand_w).sum() / denom
+
+        # ── RELATE: geodesic of predicted vs GT relative rotation R0^T R1 ──
+        both = hand_mask[:, 0] & hand_mask[:, 1]
+        if task_type_ids is not None:
+            both = both & self.grace_task_mask[task_type_ids]
+        both_f = both.float()
+        r_pred = rotation_6d_to_matrix(rel_rot6d.float())  # (B, 3, 3)
+        r0 = rotation_6d_to_matrix(gt_poses[:, 0, 3:9].float())
+        r1 = rotation_6d_to_matrix(gt_poses[:, 1, 3:9].float())
+        rel_gt = torch.matmul(r0.transpose(-1, -2), r1)
+        trace = (
+            torch.matmul(r_pred.transpose(-1, -2), rel_gt)
+            .diagonal(dim1=-2, dim2=-1)
+            .sum(-1)
+        )
+        geo = torch.acos(((trace - 1.0) / 2.0).clamp(-1 + 1e-6, 1 - 1e-6))  # (B,)
+        loss_rel_rot = (geo * both_f).sum() / both_f.sum().clamp(min=1.0)
+
+        return {
+            "loss_contact": loss_contact,
+            "loss_anchor": loss_anchor,
+            "loss_approach": loss_approach,
+            "loss_rel_rot": loss_rel_rot,
+        }
+
     def compute_loss_latent_ar(
         self,
         xyz: torch.Tensor,
@@ -662,6 +919,8 @@ class DexVLG(nn.Module):
         hand_side_ids: torch.Tensor,
         task_type_ids: torch.Tensor | None = None,
         log_l_obj: torch.Tensor | None = None,
+        grasp_center: torch.Tensor | None = None,
+        approach_dir: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Training loss for the latent_ar architecture.
 
@@ -698,7 +957,18 @@ class DexVLG(nn.Module):
         device = xyz.device
         hand_mask = hand_mask.bool()
 
-        memory, memory_mask = self.encode_condition(xyz, rgb, texts)
+        xyz3 = None
+        if self.use_grace:
+            memory, memory_mask, xyz3 = self.encode_condition(
+                xyz, rgb, texts, return_centers=True
+            )
+            if grasp_center is None or approach_dir is None or log_l_obj is None:
+                raise ValueError(
+                    "model.grace.enabled: compute_loss_latent_ar requires "
+                    "grasp_center, approach_dir, and log_l_obj batch inputs"
+                )
+        else:
+            memory, memory_mask = self.encode_condition(xyz, rgb, texts)
         mem_mask = memory_mask if self.mask_pad_tokens else None
 
         gt_prev_pose = gt_poses[:, 0] + self.hand_cond_noise_std * torch.randn_like(
@@ -710,6 +980,25 @@ class DexVLG(nn.Module):
             memory, gt_prev_pose, gt_prev_side, mem_key_padding_mask=mem_mask
         )
         z_cond = self.z_proj(ro["z_tokens"])
+
+        # GRACE thoughts (WHERE/HOW/RELATE) from the reasoner hiddens: compute
+        # the supervised losses, and build the flow condition bundle (detached
+        # if configured; None when grace.condition is false = supervise-but-
+        # don't-condition ablation).
+        grace_cond = None
+        grace_losses = None
+        if self.use_grace:
+            g = self._grace_heads(ro["hand_hidden"], memory[:, : self.num_pc])
+            rel_rot6d, rel_tok = self._grace_rel(ro["hand_hidden"])
+            grace_losses = self._grace_losses(
+                g, rel_rot6d, xyz3, gt_poses, grasp_center, approach_dir,
+                hand_mask, log_l_obj, task_type_ids,
+            )
+            if self.grace_condition:
+                ct, at = g["contact_tok"], g["approach_tok"]
+                if self.grace_detach:
+                    ct, at, rel_tok = ct.detach(), at.detach(), rel_tok.detach()
+                grace_cond = {"contact_tok": ct, "approach_tok": at, "rel_tok": rel_tok}
 
         drop_mask = None
         if self.training and self.null_cond is not None and self.cfg_drop_prob > 0:
@@ -758,6 +1047,7 @@ class DexVLG(nn.Module):
                 drop_mask=drop_mask,
                 use_rot_geo=use_rot_geo,
                 task_type_ids=task_type_ids,
+                grace_cond=grace_cond,
             )
 
         loss_flow = flow_sum / hand_mask.sum().clamp(min=1)
@@ -799,6 +1089,15 @@ class DexVLG(nn.Module):
             )
             losses["loss_probe_task"] = loss_probe_task
             losses["loss_probe_lobj"] = loss_probe_lobj
+        if grace_losses is not None:
+            total = (
+                total
+                + self.grace_w["contact"] * grace_losses["loss_contact"]
+                + self.grace_w["anchor"] * grace_losses["loss_anchor"]
+                + self.grace_w["approach"] * grace_losses["loss_approach"]
+                + self.grace_w["rel_rot"] * grace_losses["loss_rel_rot"]
+            )
+            losses.update(grace_losses)
         losses["loss"] = total
         return losses
 
@@ -817,9 +1116,15 @@ class DexVLG(nn.Module):
         drop_mask: torch.Tensor | None,
         use_rot_geo: bool,
         task_type_ids: torch.Tensor | None,
+        grace_cond: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Legacy per-slot flow terms: one flow call per hand slot with its own
         timestep; hand slot 1 sees hand slot 0 through the prev-hand token.
+
+        When ``grace_cond`` is given, each slot's flow additionally cross-attends
+        to the GRACE condition tokens in a FIXED order — ``[contact_s,
+        approach_s]`` and, at slot 1, ``[prev, rel]`` — identical to the order
+        the sampler rebuilds from the model's own predicted hiddens.
 
         Returns:
             (flow_sum, rot_geo_sum, rot_geo_cnt) accumulated over both slots.
@@ -842,8 +1147,15 @@ class DexVLG(nn.Module):
             target_v = gt_s - noise
 
             tokens = [memory, z_cond, self.h_proj(hand_hidden[:, s]).unsqueeze(1)]
+            if grace_cond is not None:
+                tokens += [
+                    grace_cond["contact_tok"][:, s : s + 1],
+                    grace_cond["approach_tok"][:, s : s + 1],
+                ]
             if s == 1:
                 tokens.append(prev_tok)
+                if grace_cond is not None:
+                    tokens.append(grace_cond["rel_tok"].unsqueeze(1))
             cond_s = torch.cat(tokens, dim=1)
             cond_mask_s = None
             if mem_mask is not None:
@@ -1094,6 +1406,7 @@ class DexVLG(nn.Module):
 
         prev_side: torch.Tensor | None = None
         prev_pose: torch.Tensor | None = None
+        prev_h: torch.Tensor | None = None
         for s in range(2):
             h_s, presence_logit, side_logits, seq_state = self.reasoner.step_hand(
                 seq_state, memory, s, prev_side, prev_pose,
@@ -1121,12 +1434,22 @@ class DexVLG(nn.Module):
                 side_s = logits_s.argmax(dim=-1)
 
             tokens = [memory, z_cond, self.h_proj(h_s).unsqueeze(1)]
+            # GRACE tokens rebuilt from the model's OWN predicted h_s (never GT)
+            # in the SAME fixed order as _sequential_flow_terms: [contact,
+            # approach] then, at slot 1, [prev, rel]. This is the train/sample
+            # consistency guarantee.
+            if self.use_grace:
+                gs = self._grace_heads(h_s.unsqueeze(1), memory[:, : self.num_pc])
+                tokens += [gs["contact_tok"][:, 0:1], gs["approach_tok"][:, 0:1]]
             if s == 1:
                 tokens.append(
                     self.prev_proj(
                         self.reasoner.embed_prev_hand(prev_side, prev_pose)
                     ).unsqueeze(1)
                 )
+                if self.use_grace:
+                    _, rel_tok = self._grace_rel(torch.stack([prev_h, h_s], dim=1))
+                    tokens.append(rel_tok.unsqueeze(1))
             cond_s = torch.cat(tokens, dim=1)
             cond_mask_s = None
             if mem_mask is not None:
@@ -1160,6 +1483,7 @@ class DexVLG(nn.Module):
             out_sides[:, s] = torch.where(mask_s, side_s, torch.full_like(side_s, -1))
             prev_side = side_s
             prev_pose = x
+            prev_h = h_s
 
         return {
             "poses": poses,
@@ -1374,11 +1698,15 @@ class DexVLG(nn.Module):
         presence_threshold: float = 0.5,
         force_sides: torch.Tensor | None = None,
         force_mask: torch.Tensor | None = None,
+        grasp_center: torch.Tensor | None = None,
+        approach_dir: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Training mode (gt_poses provided): compute flow matching loss.
         Eval mode (gt_poses=None): sample grasp poses.
         Dispatches by cfg['architecture']: legacy_bimanual (default) | latent_ar.
+        ``grasp_center`` / ``approach_dir`` (B, 2, 3) are the self-supervised
+        GRACE targets; required only when ``model.grace.enabled``.
         """
         if self.architecture == "latent_ar":
             if gt_poses is not None:
@@ -1395,6 +1723,8 @@ class DexVLG(nn.Module):
                     hand_side_ids,
                     task_type_ids=task_type_ids,
                     log_l_obj=log_l_obj,
+                    grasp_center=grasp_center,
+                    approach_dir=approach_dir,
                 )
             return self.sample_latent_ar(
                 xyz,

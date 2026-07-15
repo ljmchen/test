@@ -132,6 +132,7 @@ class DexGraspDataset(Dataset):
         obj_pose_quaternion_order: str = "wxyz",
         normalization: dict | None = None,
         multi_task: bool = False,
+        grace_targets: dict | None = None,
     ):
         """
         Args:
@@ -181,6 +182,19 @@ class DexGraspDataset(Dataset):
         self.multi_task = bool(multi_task)
         # per-hand pose normalizers (None when normalization disabled)
         self.normalizers = build_hand_normalizers(normalization, joint_dim=self.joint_dim)
+
+        # GRACE self-supervised targets (data.grace_targets). When enabled,
+        # multi_task items additionally emit per-hand grasp_center and
+        # approach_dir in the RAW object-centered frame (same frame as xyz),
+        # derived from GT wrist geometry — no external labels. Default off =
+        # legacy items (collate/legacy tests unaffected).
+        gt_cfg = dict(grace_targets or {})
+        self._grace_on = bool(gt_cfg.get("enabled", False))
+        palm_axis = torch.tensor(
+            gt_cfg.get("palm_forward_axis", [0.0, 0.0, 1.0]), dtype=torch.float32
+        )
+        self._palm_axis = palm_axis / (palm_axis.norm() + 1e-8)
+        self._palm_offset = float(gt_cfg.get("palm_offset", 0.09))
 
         # Cache the raw (pre-transform) per-object geometry so the cache size is
         # bounded by the number of unique objects, not the number of records.
@@ -385,7 +399,7 @@ class DexGraspDataset(Dataset):
             raise ValueError(f"Record idx={idx} obj_id={obj_id!r} has no dex_grasp_left/right.")
         L_obj = self._object_scale_length(record)
 
-        return {
+        item = {
             "xyz": xyz,
             "rgb": rgb,
             "text": guidance,
@@ -397,6 +411,37 @@ class DexGraspDataset(Dataset):
             "cate_id": str(record.get("cate_id", "")),
             "group_id": group_id_of(record),
         }
+        if self._grace_on:
+            item["grasp_center"], item["approach_dir"] = self._grace_targets(record, sides)
+        return item
+
+    def _grace_targets(
+        self, record: dict, sides: list[str]
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Self-supervised GRACE targets in the raw object-centered frame.
+
+        For each present hand: the wrist frame ``R`` is recovered from the
+        object-centered axis-angle, the approach direction is ``R @ palm_axis``
+        (unit), and the contact center is ``wrist + palm_offset * approach_dir``.
+        Both live in the SAME frame as ``xyz`` (and the model's PC token centers),
+        so no object/mesh info is needed.
+
+        Args:
+            record: Split record.
+            sides: Present hand sides in canonical order.
+
+        Returns:
+            grasp_center list and approach_dir list, one (3,) tensor per side.
+        """
+        grasp_center, approach_dir = [], []
+        for side in sides:
+            raw = torch.tensor(record[f"dex_grasp_{side}"], dtype=torch.float32)
+            centered = self._center_hand_pose(raw, record)
+            rot = axis_angle_to_matrix(canonicalize_axis_angle(centered[3:6]))
+            adir = rot @ self._palm_axis
+            approach_dir.append(adir)
+            grasp_center.append(centered[:3] + self._palm_offset * adir)
+        return grasp_center, approach_dir
 
     def __getitem__(self, idx: int) -> dict:
         record = self.data[idx]
@@ -440,6 +485,17 @@ def _collate_multi_task(batch: list[dict], result: dict) -> dict:
     result["hand_side_ids"] = hand_side_ids
     result["L_obj"] = torch.tensor([b["L_obj"] for b in batch], dtype=torch.float32)
     result["task_types"] = [b["task_type"] for b in batch]
+    if "grasp_center" in batch[0]:
+        # GRACE targets: zero-padded (B, 2, 3) in the same slot order as
+        # gt_poses. Pad slots stay [0,0,0] (masked out downstream).
+        grasp_center = torch.zeros(len(batch), num_slots, 3, dtype=torch.float32)
+        approach_dir = torch.zeros(len(batch), num_slots, 3, dtype=torch.float32)
+        for i, item in enumerate(batch):
+            for slot, (gc, ad) in enumerate(zip(item["grasp_center"], item["approach_dir"])):
+                grasp_center[i, slot] = gc
+                approach_dir[i, slot] = ad
+        result["grasp_center"] = grasp_center
+        result["approach_dir"] = approach_dir
     return result
 
 

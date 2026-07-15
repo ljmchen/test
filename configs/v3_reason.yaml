@@ -1,0 +1,198 @@
+# DexVLG v3 + GRACE configuration (latent_ar architecture).
+# GRACE = Grounded Reasoning over Approach & Contact: the reasoner emits three
+# SUPERVISED, VISUALIZABLE "thoughts" per hand — WHERE (contact heatmap over the
+# PointNet++ token centers), HOW (a categorical approach direction on an S^2
+# codebook), RELATE (inter-hand relative rotation) — that condition the flow.
+# The flow OUTPUT space and the whole infer -> prepare_bench_data -> dgbench
+# chain are UNCHANGED, so the GT baseline is untouched. Trains from scratch.
+#
+# Launch (always under tmux, idle GPU):
+#   tmux new -d -s v3reason
+#   tmux send-keys -t v3reason 'CUDA_VISIBLE_DEVICES=<idle> \
+#     /mnt/conda/jiaxuan/miniconda3/envs/dexvlg/bin/python train.py \
+#     --config configs/v3_reason.yaml' Enter
+
+# ─── Model ────────────────────────────────────────────────────────────
+model:
+  architecture: latent_ar
+
+  # Point cloud encoder (PointNet++)
+  pc_in_channels: 3          # xyz-only
+  pc_feature_dim: 256
+  num_pc_tokens: 64
+
+  # Language model
+  language_backbone: modernbert
+  bert_model: "pretrained_models/ModernBERT-base"
+  bert_dim: 768
+  freeze_bert_embeddings: false
+  lang_padding: max_length
+  mask_pad_tokens: true
+
+  # Fusion transformer
+  fusion_depth: 4
+
+  # Flow-Matching Transformer (one call per hand under latent_ar)
+  flow_hidden_dim: 256
+  flow_depth: 6
+  flow_heads: 8
+
+  joint_dim: 22
+
+  # Per-element flow-loss weights (joints otherwise dominate the MSE).
+  flow_loss_component_weights:
+    translation: 3.0
+    rotation: 6.0
+    joint: 1.0
+
+  # Autoregressive latent reasoner (Coconut-style thinking + per-hand steps).
+  reasoner:
+    dim: 512
+    depth: 4
+    num_heads: 8
+    num_thinking_tokens: 6
+    max_hands: 2
+    feedback_norm: true
+    mlp_ratio: 4.0
+    hand_cond_noise_std: 0.1
+    # The old free-form aux probe is subsumed by GRACE's supervised thoughts.
+    aux_probe:
+      enabled: false
+      hidden_dim: 256
+      num_task_types: 4
+
+  # Total-loss weights for the latent_ar objective.
+  loss_weights:
+    flow: 1.0
+    presence: 0.5
+    side: 0.5
+    probe: 0.1
+
+  # GRACE stays on the sequential per-hand flow path (joint_hand_denoise off).
+  hand_interaction:
+    enabled: true
+    cross_hand_attn: false
+
+  # Classifier-Free Guidance off for the main run. Optional lever for
+  # bottleneck 3 (weak conditioning): set drop_prob: 0.1 to train the null
+  # branch, then scan inference guidance_scale on lgbidex only.
+  cfg:
+    drop_prob: 0.0
+    guidance_scale: 1.0
+
+  # Retire the unsupervised affordance pool — GRACE's supervised contact token
+  # replaces it (ablation row 8 flips this back on to show it was a no-op).
+  affordance:
+    enabled: false
+    hidden_dim: 192
+
+  # ─── GRACE (Grounded Reasoning over Approach & Contact) ───────────────
+  grace:
+    enabled: true
+    num_approach_anchors: 64      # M; S^2 Fibonacci codebook (ablate {1,16,32,64})
+    hidden_dim: 256
+    # scale-aware contact Gaussian sigma = clamp(scale * L_obj, min, max) [m]
+    contact_sigma_scale: 0.3
+    contact_sigma_min: 0.01
+    contact_sigma_max: 0.05
+    condition: true               # false = supervise-but-don't-condition ablation
+    detach_condition: false       # true = detached-token ablation
+    task_types: []                # [] = all task types; [lgbidex] for red-line safety
+    w_contact: 0.5                # WHERE
+    w_anchor: 0.5                 # HOW (discrete mode CE) — primary rotation lever
+    w_approach: 0.25              # HOW (S^2 cosine precision) — enables the oracle
+    w_rel_rot: 0.5                # RELATE (bottleneck 2, rel_r)
+
+# ─── Data ─────────────────────────────────────────────────────────────
+data:
+  train_data: "/home/jiaxuan/data/pose_data/train_fuse_v2_split.json"
+  val_data: "/home/jiaxuan/data/pose_data/val_fuse_v2_split.json"
+  test_data: "/home/jiaxuan/data/pose_data/test_fuse_v2.json"
+  mesh_root: "/home/jiaxuan/data/oakink_obj/processed_data"
+  multi_task: true
+  n_points: 4096
+  augment: false
+  point_cloud_source: mesh_sample
+  point_cloud_color_mode: fill
+  point_cloud_color_fill: 0.4
+  center_on_object: true
+  obj_pose_quaternion_order: wxyz
+  normalization:
+    enabled: true
+    mode: relquantile11
+    stats_path: tools/norm_stats_v3.json
+
+  # ─── GRACE self-supervised targets (raw object frame; no external labels) ──
+  # palm_forward_axis is the Shadow palm's local approach axis; palm_offset [m]
+  # is the wrist->contact-center distance. Both only shape the (deterministic)
+  # target — a wrong value weakens but never corrupts, and never touches the
+  # output. Inspect the WHERE heatmap on ~10 lgbidex samples and refine if the
+  # blob sits off the hand region.
+  grace_targets:
+    enabled: true
+    palm_forward_axis: [0.0, 0.0, 1.0]
+    palm_offset: 0.09
+
+# ─── Training ─────────────────────────────────────────────────────────
+training:
+  epochs: 200
+  batch_size: 128
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 1000
+  grad_clip: 1.0
+
+  optimizer: "adamw"
+  scheduler: "cosine"
+  num_workers: 12
+  persistent_workers: true
+  prefetch_factor: 2
+  seed: 42
+
+  ema:
+    enabled: false
+    decay: 0.9999
+
+  precision: bf16
+  fp16: true
+  log_interval: 5000
+  val_interval: 5
+  val_max_batches: 200
+  val_decision_max_batches: 10
+  keep_best_k: 3
+  save_interval: 10
+
+  val_score_weights:
+    translation: 3.0
+    rotation: 6.0
+    joint: 1.0
+    structure: 1.0
+    relative: 1.0
+  val_score_reduce: macro
+
+  val_group_min: true
+
+  epoch_sampling:
+    enabled: true
+    group_keys: [obj_id, pose_id, scale_id, guidance]
+    samples_per_group: 1
+    val_samples_per_group: 1
+    scenario_key: task_type
+    scenario_shares:
+      left: 0.15
+      right: 0.15
+      lgbidex: 0.35
+      bidex: 0.35
+    epoch_size: null
+
+# ─── Inference ────────────────────────────────────────────────────────
+inference:
+  num_steps: 10
+  presence_threshold: 0.5
+  batch_size: 256
+
+# ─── Paths ────────────────────────────────────────────────────────────
+paths:
+  output_dir: "outputs/test_v3reason_scratch"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
